@@ -2983,6 +2983,15 @@ class SemesterSaveRequest(BaseModel):
     content: list = []
     credits_grant: int = 0
 
+# Sentinel written to razorpay_payment_id when an admin grants LMS access
+# manually, so it is distinguishable from a genuine Razorpay payment.
+_MANUAL_LMS_GRANT = "manual_admin_grant"
+
+
+class LMSAccessRequest(BaseModel):
+    lms_paid: bool
+
+
 class AddStudentRequest(BaseModel):
     email: str
     program_id: Optional[int] = None
@@ -3024,6 +3033,7 @@ def _ustudent_row(us: UniversityStudent, email: str = None, program_name: str = 
         "program_id": us.program_id, "program_name": program_name,
         "email": email, "current_semester": us.current_semester,
         "status": us.status, "lms_paid": us.lms_paid,
+        "manual_grant": us.razorpay_payment_id == _MANUAL_LMS_GRANT,
         "enrolled_at": us.enrolled_at.isoformat() if us.enrolled_at else None,
         "promoted_at": us.promoted_at.isoformat() if us.promoted_at else None,
     }
@@ -3284,6 +3294,55 @@ def admin_remove_uni_student(uid: int, user_id: int, admin: Admin = Depends(get_
     db.commit()
     write_audit(db, admin.id, "university", uid, "remove_student", {"user_id": user_id}, {})
     return {"success": True}
+
+@app.put("/api/admin/universities/{uid}/students/{user_id}/lms-access")
+def admin_set_lms_access(
+    uid: int, user_id: int, req: LMSAccessRequest,
+    admin: Admin = Depends(get_current_admin), db: Session = Depends(get_db),
+):
+    """Grant or revoke LMS access without a Razorpay payment.
+
+    Needed because Razorpay Checkout only runs on domains registered with the
+    account, so it cannot be exercised on a bare IP. Also covers students whose
+    university pays offline. Mirrors lms_verify_payment, but stamps the grant
+    as manual so a revoke can tell an admin comp apart from a real purchase.
+    """
+    us = db.query(UniversityStudent).filter(
+        UniversityStudent.university_id == uid,
+        UniversityStudent.user_id == user_id,
+    ).first()
+    if not us:
+        raise HTTPException(status_code=404, detail="Student not enrolled in this university")
+    if us.lms_paid == req.lms_paid:
+        return _ustudent_row(us)
+
+    before = _ustudent_row(us)
+    user = db.query(User).filter(User.id == user_id).first()
+    uni = db.query(University).filter(University.id == uid).first()
+    grant = (uni.credits_per_student or 0) if uni else 0
+
+    if req.lms_paid:
+        us.lms_paid = True
+        us.status = "active"
+        us.razorpay_payment_id = _MANUAL_LMS_GRANT
+        if user and grant > 0:
+            user.available_credits += grant
+    else:
+        us.lms_paid = False
+        us.status = "pending"
+        # Only claw back credits this endpoint handed out — a real payment's
+        # credits stay with the student.
+        if us.razorpay_payment_id == _MANUAL_LMS_GRANT:
+            if user and grant > 0:
+                user.available_credits = max(0, user.available_credits - grant)
+            us.razorpay_payment_id = None
+
+    db.commit()
+    write_audit(db, admin.id, "university_student", us.id,
+                "grant_lms_access" if req.lms_paid else "revoke_lms_access",
+                before, _ustudent_row(us))
+    return _ustudent_row(us)
+
 
 @app.post("/api/admin/universities/{uid}/students/{user_id}/promote")
 def admin_promote_student(uid: int, user_id: int, admin: Admin = Depends(get_current_admin), db: Session = Depends(get_db)):
