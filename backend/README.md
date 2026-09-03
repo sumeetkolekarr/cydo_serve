@@ -42,9 +42,35 @@ SELECT item, CASE WHEN present THEN 'yes' ELSE 'NO  <-- missing' END AS status F
 ) t ORDER BY item;
 ```
 
-## Not published here
+## `main_all_in_one.py`
 
-`main_all_in_one.py` is **not** in this repo. It currently carries hardcoded
-AWS credentials and a lab password in source, and this repository is public.
-It has to be moved onto environment variables before it can be published here.
-Until then it is still copied to the server by hand.
+The production API — the only backend file that ships. Deploy it with:
+
+```bash
+cd /var/www/cydo_serve && git pull origin main
+cp /var/www/cydo_serve/backend/main_all_in_one.py /root/cyberdojo/backend/main.py
+
+source /root/cyberdojo/backend/venv/bin/activate
+pkill -9 gunicorn && sleep 2
+cd /root/cyberdojo/backend
+gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 300 --daemon
+```
+
+### Required environment
+
+This repository is public, so the file carries **no credentials**. Every secret
+is read from `/root/cyberdojo/backend/.env`, and these must all be present
+before you deploy:
+
+| Variable | Used for |
+|---|---|
+| `DATABASE_URL` | Postgres connection. The app raises at startup if unset. |
+| `SECRET_KEY` | JWT signing |
+| `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` | Payments |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | EC2 lab provisioning |
+| `SMTP_USER`, `SMTP_PASSWORD` | Outbound email |
+| `GUI_LAB_VNC_PASSWORD` | Credential baked into the lab AMI; returned to students and set by the Ubuntu lab user-data |
+
+Missing values fail differently: `DATABASE_URL` stops the process at import,
+while the others fail at the point of use — labs won't launch without the AWS
+pair, email silently fails without the SMTP pair.
