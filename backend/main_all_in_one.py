@@ -41,6 +41,7 @@ import hashlib
 import random
 import socket
 import string
+import threading
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -158,6 +159,9 @@ class CreditTransaction(Base):
     plan_name = Column(String)
     credits_added = Column(Integer, nullable=False)
     amount_paid = Column(Numeric(10, 2), nullable=False)
+    # UNIQUE so a Razorpay order can only ever be credited once. Without it a
+    # valid signature could be replayed indefinitely to mint credits.
+    razorpay_order_id = Column(String(64), unique=True, index=True)
     purchased_at = Column(DateTime(timezone=True), server_default=sqlfunc.now())
 
 
@@ -532,6 +536,44 @@ def create_admin_token(admin_id: int, role: str, email: str) -> str:
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
+# ============================================================================
+# RATE LIMITING
+# ============================================================================
+# Credential endpoints were previously unthrottled, so a password could be
+# brute-forced as fast as the network allowed. This is an in-process counter,
+# so with 4 gunicorn workers the real ceiling is up to 4x the configured limit
+# — enough to blunt an attack without adding a Redis dependency. Swap for a
+# shared store if a hard guarantee is ever needed.
+_RATE_BUCKETS: Dict[str, List[float]] = {}
+_RATE_LOCK = threading.Lock()
+
+
+def _client_key(request: Request, scope: str) -> str:
+    # X-Forwarded-For first: nginx proxies every request, so request.client
+    # would otherwise be 127.0.0.1 for everyone.
+    fwd = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    ip = fwd or (request.client.host if request.client else "unknown")
+    return f"{scope}:{ip}"
+
+
+def _rate_limit_or_raise(key: str, limit: int, window_seconds: int):
+    now = time.time()
+    with _RATE_LOCK:
+        # Opportunistic cleanup so the dict cannot grow without bound.
+        if len(_RATE_BUCKETS) > 10000:
+            for k in [k for k, v in _RATE_BUCKETS.items() if not v or now - v[-1] > 3600]:
+                _RATE_BUCKETS.pop(k, None)
+        hits = [t for t in _RATE_BUCKETS.get(key, []) if now - t < window_seconds]
+        if len(hits) >= limit:
+            _RATE_BUCKETS[key] = hits
+            raise HTTPException(
+                status_code=429,
+                detail="Too many attempts. Please wait a few minutes and try again.",
+            )
+        hits.append(now)
+        _RATE_BUCKETS[key] = hits
+
+
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -548,6 +590,12 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    # A suspended account must lose access immediately. Without this a ban only
+    # takes effect when the token expires, which is up to 30 days with
+    # rememberMe. Tested against False rather than falsiness so a legacy NULL
+    # row is treated as active and nobody is locked out by this change.
+    if user.is_active is False:
+        raise HTTPException(status_code=403, detail="This account has been suspended")
     return user
 
 
@@ -592,9 +640,24 @@ def write_audit(db: Session, admin_id: int, action: str, entity_type: str, entit
 # ============================================================================
 app = FastAPI(title="CyberDojo API")
 
+# Browser origins allowed to call this API. `allow_origins=["*"]` together with
+# allow_credentials lets any site on the internet issue authenticated requests
+# from a logged-in visitor's browser, so the list is explicit. Override with
+# CORS_ORIGINS (comma-separated) when the production domain is ready — add the
+# https:// form there rather than editing this file.
+_DEFAULT_ORIGINS = [
+    "http://18.60.233.72",
+    "http://localhost:5173",   # vite dev server
+    "http://localhost:4173",   # vite preview
+]
+CORS_ORIGINS = [
+    o.strip() for o in os.getenv("CORS_ORIGINS", ",".join(_DEFAULT_ORIGINS)).split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict to production domain
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -715,11 +778,14 @@ class VerifyPaymentRequest(BaseModel):
     razorpay_order_id: str
     razorpay_payment_id: str
     razorpay_signature: str
-    user_id: int
     plan_name: str
-    credits: int
-    amount: float
     coupon_code: Optional[str] = None
+    # user_id / credits / amount are still accepted so existing clients keep
+    # working, but they are ignored: the user comes from the token and the
+    # credits and price are looked up from the credit pack on the server.
+    user_id: Optional[int] = None
+    credits: Optional[int] = None
+    amount: Optional[float] = None
 
 
 class SubscribePlan(BaseModel):
@@ -1054,7 +1120,8 @@ def get_unified_catalog(db: Session = Depends(get_db)):
 # USER-FACING ROUTES: AUTH
 # ============================================================================
 @app.post("/api/auth/signup")
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
+def create_user(user: UserCreate, request: Request, db: Session = Depends(get_db)):
+    _rate_limit_or_raise(_client_key(request, "signup"), limit=5, window_seconds=600)
     if not user.terms:
         raise HTTPException(status_code=400, detail="You must agree to terms")
     if db.query(User).filter(User.email == user.email).first():
@@ -1090,7 +1157,8 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/signin")
-def login(user: UserLogin, db: Session = Depends(get_db)):
+def login(user: UserLogin, request: Request, db: Session = Depends(get_db)):
+    _rate_limit_or_raise(_client_key(request, "signin"), limit=10, window_seconds=300)
     db_user = db.query(User).filter(User.email == user.email).first()
     if not db_user or not verify_password(user.password, db_user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -1351,35 +1419,55 @@ def get_credit_history(
 
 
 @app.post("/api/credits/verify-payment")
-def verify_and_credit(req: VerifyPaymentRequest, db: Session = Depends(get_db)):
+def verify_and_credit(
+    req: VerifyPaymentRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Confirm a credit purchase.
+
+    Everything that decides how many credits are granted, and to whom, is
+    derived on the server: the account comes from the token and the credits and
+    price from the credit pack. The body's user_id/credits/amount are ignored.
+    A Razorpay order can only be credited once, enforced by a UNIQUE column, so
+    a valid signature cannot be replayed.
+    """
     body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
     expected_signature = hmac.new(
         key=os.getenv("RAZORPAY_KEY_SECRET", "").encode("utf-8"),
         msg=body.encode("utf-8"),
         digestmod=hashlib.sha256,
     ).hexdigest()
-    if expected_signature != req.razorpay_signature:
+    # Constant-time compare, matching the webhook handler.
+    if not hmac.compare_digest(expected_signature, req.razorpay_signature):
         raise HTTPException(status_code=400, detail="Invalid payment signature")
 
-    user = db.query(User).filter(User.id == req.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = current_user
 
-    _grant_referral_reward_on_first_purchase(user.id, db)
-    user.available_credits += req.credits
-    transaction = CreditTransaction(
-        user_id=req.user_id,
-        plan_name=req.plan_name,
-        credits_added=req.credits,
-        amount_paid=req.amount,
+    # Replay guard. Razorpay legitimately retries, and a user can double-click,
+    # so a repeat is reported as a duplicate rather than treated as an error.
+    existing = db.query(CreditTransaction).filter(
+        CreditTransaction.razorpay_order_id == req.razorpay_order_id
+    ).first()
+    if existing:
+        return {
+            "message": "Payment already processed",
+            "duplicate": True,
+            "new_balance": user.available_credits,
+        }
+
+    pack = (
+        db.query(CreditPack)
+        .filter(CreditPack.pack_name == req.plan_name, CreditPack.is_active == True)
+        .first()
     )
-    db.add(transaction)
-    db.flush()  # need transaction.id for the redemption FK
+    if not pack:
+        raise HTTPException(status_code=400, detail="Unknown credit pack")
 
-    # Record coupon redemption if the order was placed with one.
-    # We trust the verified signature: the order_id was signed by Razorpay against
-    # the amount we created the order with, so coupon_code arriving here matches
-    # the discount that was actually applied to the charge.
+    # Same helpers create-order used to price the charge, so the recorded
+    # amount matches what Razorpay actually collected.
+    coupon = None
+    discount_percent = 0
     if req.coupon_code:
         coupon = (
             db.query(Coupon)
@@ -1387,32 +1475,51 @@ def verify_and_credit(req: VerifyPaymentRequest, db: Session = Depends(get_db)):
             .first()
         )
         if coupon:
-            already = (
-                db.query(CouponRedemption)
-                .filter(
-                    CouponRedemption.coupon_id == coupon.id,
-                    CouponRedemption.user_id == req.user_id,
-                )
-                .first()
+            discount_percent = coupon.discount_percent or 0
+    paid_total = with_gst(_apply_coupon_to_base(float(pack.price), discount_percent))
+    full_total = with_gst(float(pack.price))
+
+    _grant_referral_reward_on_first_purchase(user.id, db)
+    user.available_credits += pack.credits
+    transaction = CreditTransaction(
+        user_id=user.id,
+        plan_name=pack.pack_name,
+        credits_added=pack.credits,
+        amount_paid=paid_total,
+        razorpay_order_id=req.razorpay_order_id,
+    )
+    db.add(transaction)
+    try:
+        db.flush()  # need transaction.id for the redemption FK
+    except IntegrityError:
+        # Two confirmations for the same order raced; the other one won.
+        db.rollback()
+        fresh = db.query(User).filter(User.id == user.id).first()
+        return {
+            "message": "Payment already processed",
+            "duplicate": True,
+            "new_balance": fresh.available_credits if fresh else 0,
+        }
+
+    if coupon:
+        already = (
+            db.query(CouponRedemption)
+            .filter(
+                CouponRedemption.coupon_id == coupon.id,
+                CouponRedemption.user_id == user.id,
             )
-            if not already:
-                # Discount value = (full inclusive price for this pack) - (paid inclusive amount).
-                pack = (
-                    db.query(CreditPack)
-                    .filter(CreditPack.pack_name == req.plan_name)
-                    .first()
-                )
-                full_total = with_gst(float(pack.price)) if pack else 0
-                discount_amount = max(0.0, float(full_total) - float(req.amount))
-                db.add(CouponRedemption(
-                    coupon_id=coupon.id,
-                    user_id=req.user_id,
-                    credit_transaction_id=transaction.id,
-                    discount_amount=discount_amount,
-                ))
-                coupon.uses_count = (coupon.uses_count or 0) + 1
+            .first()
+        )
+        if not already:
+            db.add(CouponRedemption(
+                coupon_id=coupon.id,
+                user_id=user.id,
+                credit_transaction_id=transaction.id,
+                discount_amount=max(0.0, float(full_total) - float(paid_total)),
+            ))
+            coupon.uses_count = (coupon.uses_count or 0) + 1
     db.commit()
-    return {"message": f"{req.credits} credits added", "new_balance": user.available_credits}
+    return {"message": f"{pack.credits} credits added", "new_balance": user.available_credits}
 
 
 # ============================================================================

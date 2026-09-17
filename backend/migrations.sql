@@ -42,8 +42,16 @@ CREATE TABLE IF NOT EXISTS credit_transactions (
     plan_name VARCHAR(50),
     credits_added INTEGER NOT NULL,
     amount_paid DECIMAL(10, 2) NOT NULL,
+    razorpay_order_id VARCHAR(64),
     purchased_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Replay protection for credit purchases: a Razorpay order may only be
+-- credited once. NULLs are exempt from UNIQUE in Postgres, so historic rows
+-- (which predate this column) coexist with the constraint untouched.
+ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS razorpay_order_id VARCHAR(64);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_credit_tx_rzp_order
+    ON credit_transactions(razorpay_order_id);
 
 -- 4. Contact Messages
 CREATE TABLE IF NOT EXISTS contact_messages (
