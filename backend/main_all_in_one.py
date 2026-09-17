@@ -1113,7 +1113,13 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
 # USER-FACING ROUTES: PROFILE
 # ============================================================================
 @app.get("/api/users/{user_id}/profile")
-def get_profile(user_id: int, db: Session = Depends(get_db)):
+def get_profile(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Cannot view another user's profile")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1143,7 +1149,14 @@ def get_profile(user_id: int, db: Session = Depends(get_db)):
 
 
 @app.put("/api/users/{user_id}/profile")
-def update_profile(user_id: int, payload: UpdateProfileRequest, db: Session = Depends(get_db)):
+def update_profile(
+    user_id: int,
+    payload: UpdateProfileRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Cannot edit another user's profile")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1828,7 +1841,13 @@ def submit_contact_form(form: ContactForm, db: Session = Depends(get_db)):
 # USER-FACING ROUTES: REFERRALS
 # ============================================================================
 @app.get("/api/referrals/{user_id}")
-def get_referral_stats(user_id: int, db: Session = Depends(get_db)):
+def get_referral_stats(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Cannot view another user's referrals")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
