@@ -18,13 +18,12 @@ cd /var/www/cydo_serve && git pull origin main
 sudo -u postgres psql -d cyberdojo -f /var/www/cydo_serve/backend/migrations.sql
 ```
 
-Then restart the API so the ORM models match the schema:
+Then restart the API so the ORM models match the schema (the API runs as the
+systemd unit `cyberdojo`; do not `pkill` or hand-launch gunicorn):
 
 ```bash
-source /root/cyberdojo/backend/venv/bin/activate
-pkill -9 gunicorn && sleep 2
-cd /root/cyberdojo/backend
-gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 300 --daemon
+sudo systemctl restart cyberdojo
+journalctl -u cyberdojo -n 50 --no-pager   # confirm a clean start
 ```
 
 ### Verifying what's applied
@@ -50,10 +49,8 @@ The production API — the only backend file that ships. Deploy it with:
 cd /var/www/cydo_serve && git pull origin main
 cp /var/www/cydo_serve/backend/main_all_in_one.py /root/cyberdojo/backend/main.py
 
-source /root/cyberdojo/backend/venv/bin/activate
-pkill -9 gunicorn && sleep 2
-cd /root/cyberdojo/backend
-gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 300 --daemon
+sudo systemctl restart cyberdojo
+journalctl -u cyberdojo -n 50 --no-pager   # confirm a clean start
 ```
 
 ### Required environment
@@ -70,7 +67,16 @@ before you deploy:
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | EC2 lab provisioning |
 | `SMTP_USER`, `SMTP_PASSWORD` | Outbound email |
 | `GUI_LAB_VNC_PASSWORD` | Credential baked into the lab AMI; returned to students and set by the Ubuntu lab user-data |
+| `RAZORPAY_WEBHOOK_SECRET`, `RZP_PLAN_*` (6) | Recurring subscriptions and their webhook |
+| `CORS_ORIGINS`, `GST_RATE`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM` | Optional; defaults in code |
 
 Missing values fail differently: `DATABASE_URL` stops the process at import,
-while the others fail at the point of use — labs won't launch without the AWS
-pair, email silently fails without the SMTP pair.
+while the others fail at the point of use: without the AWS pair every lab launch
+returns HTTP 500 (`NoCredentialsError`) and still charges the credit; without the
+SMTP pair email silently fails.
+
+After editing `.env`, run `sudo systemctl restart cyberdojo`: the app reads it only at
+startup. Check which variables are set (names only) with
+`grep -oE '^[A-Z_]+=.' /root/cyberdojo/backend/.env | sed 's/=.*/= <set>/'`.
+
+Full platform documentation lives in the private source repo under `docs/main_web/`.
