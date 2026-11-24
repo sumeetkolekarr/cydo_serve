@@ -1072,6 +1072,50 @@ class AssessmentViolationLog(BaseModel):
 # ============================================================================
 # HELPERS
 # ============================================================================
+def _verify_checkout_signature(order_id: str, payment_id: str, signature: str) -> None:
+    """Raise 400 unless the Razorpay checkout signature is valid."""
+    expected = hmac.new(
+        key=os.getenv("RAZORPAY_KEY_SECRET", "").encode("utf-8"),
+        msg=f"{order_id}|{payment_id}".encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, signature or ""):
+        raise HTTPException(status_code=400, detail="Invalid payment signature")
+
+
+def _fetch_own_order(order_id: str, user_id: int) -> tuple:
+    """Fetch a Razorpay order and confirm it was created for this user.
+
+    A valid checkout signature proves that *some* payment was made for
+    `order_id`, but not what was bought. The order's amount and notes were set
+    by our own create-order endpoints, so they, not the request body, decide
+    what is granted. Without this, paying for the cheapest item and naming the
+    most expensive one in the verify call would succeed.
+
+    Returns (order, notes).
+    """
+    try:
+        order = razorpay_client.order.fetch(order_id)
+    except Exception as exc:
+        print(f"Razorpay order fetch failed for {order_id}: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not confirm the payment with Razorpay. Please try again or contact support.",
+        )
+    notes = order.get("notes") or {}
+    if not isinstance(notes, dict):   # Razorpay returns [] when an order has no notes
+        notes = {}
+    if str(notes.get("user_id", "")) != str(user_id):
+        raise HTTPException(status_code=400, detail="This payment belongs to a different account")
+    return order, notes
+
+
+def _require_amount(order: dict, expected_paise) -> None:
+    """Raise 400 unless the order was created for exactly `expected_paise`."""
+    if int(order.get("amount", -1)) != int(expected_paise):
+        raise HTTPException(status_code=400, detail="Payment amount does not match the item")
+
+
 def generate_referral_code() -> str:
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
@@ -1432,16 +1476,9 @@ def verify_and_credit(
     A Razorpay order can only be credited once, enforced by a UNIQUE column, so
     a valid signature cannot be replayed.
     """
-    body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
-    expected_signature = hmac.new(
-        key=os.getenv("RAZORPAY_KEY_SECRET", "").encode("utf-8"),
-        msg=body.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-    # Constant-time compare, matching the webhook handler.
-    if not hmac.compare_digest(expected_signature, req.razorpay_signature):
-        raise HTTPException(status_code=400, detail="Invalid payment signature")
-
+    _verify_checkout_signature(
+        req.razorpay_order_id, req.razorpay_payment_id, req.razorpay_signature
+    )
     user = current_user
 
     # Replay guard. Razorpay legitimately retries, and a user can double-click,
@@ -1456,9 +1493,12 @@ def verify_and_credit(
             "new_balance": user.available_credits,
         }
 
+    # The pack and coupon come from the order create-order made, never from
+    # the body, and the order amount must equal that pack's price.
+    order, notes = _fetch_own_order(req.razorpay_order_id, user.id)
     pack = (
         db.query(CreditPack)
-        .filter(CreditPack.pack_name == req.plan_name, CreditPack.is_active == True)
+        .filter(CreditPack.pack_name == notes.get("plan_name"))
         .first()
     )
     if not pack:
@@ -1468,16 +1508,18 @@ def verify_and_credit(
     # amount matches what Razorpay actually collected.
     coupon = None
     discount_percent = 0
-    if req.coupon_code:
+    coupon_code = notes.get("coupon_code")
+    if coupon_code:
         coupon = (
             db.query(Coupon)
-            .filter(Coupon.code == req.coupon_code.strip().upper())
+            .filter(Coupon.code == str(coupon_code).strip().upper())
             .first()
         )
         if coupon:
             discount_percent = coupon.discount_percent or 0
     paid_total = with_gst(_apply_coupon_to_base(float(pack.price), discount_percent))
     full_total = with_gst(float(pack.price))
+    _require_amount(order, paid_total * 100)
 
     _grant_referral_reward_on_first_purchase(user.id, db)
     user.available_credits += pack.credits
@@ -1587,26 +1629,9 @@ def verify_subscription_payment(req: SubVerifyPayment, db: Session = Depends(get
     return {"message": "Subscription activated successfully", "expires_on": end_date.isoformat()}
 
 
-@app.post("/api/subscriptions/subscribe")
-def create_subscription_legacy(req: SubscribePlan, db: Session = Depends(get_db)):
-    """Legacy free-tier path (no payment). Kept for backwards compat."""
-    user = db.query(User).filter(User.id == req.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    start_date = datetime.utcnow()
-    end_date = start_date + (
-        timedelta(days=365) if req.billing_cycle == "annual" else timedelta(days=30)
-    )
-    db.query(Subscription).filter(
-        Subscription.user_id == req.user_id, Subscription.is_active == True
-    ).update({"is_active": False})
-    new_sub = Subscription(
-        user_id=user.id, plan_name=req.plan_name,
-        billing_cycle=req.billing_cycle, start_date=start_date, end_date=end_date,
-    )
-    db.add(new_sub)
-    db.commit()
-    return {"message": "Subscription activated successfully", "expires_on": end_date.isoformat()}
+# /api/subscriptions/subscribe (a legacy free-tier path with no login and no
+# payment, which let anyone activate any plan for any user) was removed on
+# 2026-11-24. Subscriptions are created only through the Razorpay flows.
 
 
 # ----------------------------------------------------------------------------
@@ -3577,19 +3602,20 @@ def lms_create_order(current_user: User = Depends(get_current_user), db: Session
 
 @app.post("/api/lms/verify-payment")
 def lms_verify_payment(req: LMSVerifyRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
-    expected = hmac.new(
-        key=os.getenv("RAZORPAY_KEY_SECRET", "").encode("utf-8"),
-        msg=body.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-    if expected != req.razorpay_signature:
-        raise HTTPException(status_code=400, detail="Invalid payment signature")
+    _verify_checkout_signature(
+        req.razorpay_order_id, req.razorpay_payment_id, req.razorpay_signature
+    )
     us = db.query(UniversityStudent).filter(UniversityStudent.user_id == current_user.id).first()
     if not us:
         raise HTTPException(status_code=403, detail="Not enrolled in any university LMS")
     if us.lms_paid:
         return {"success": True, "duplicate": True}
+    # One LMS payment unlocks one account: the order must be this user's LMS
+    # order, for the LMS price.
+    order, notes = _fetch_own_order(req.razorpay_order_id, current_user.id)
+    if notes.get("type") != "lms":
+        raise HTTPException(status_code=400, detail="This payment is not an LMS payment")
+    _require_amount(order, with_gst(LMS_PRICE_INR) * 100)
     uni = db.query(University).filter(University.id == us.university_id).first()
     us.lms_paid = True
     us.status = "active"
@@ -4071,7 +4097,9 @@ _USER_DATA_UBUNTU_DPI = _USER_DATA_UBUNTU_DPI.replace(
 # REQUEST MODEL
 # ============================================================================
 class StartLabRequest(BaseModel):
-    userID: int
+    # Ignored: every start-lab route charges and launches for the signed-in
+    # user. Still accepted so existing frontends keep working.
+    userID: Optional[int] = None
 
 
 # ============================================================================
@@ -4373,22 +4401,20 @@ def verify_course_payment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
-    expected_signature = hmac.new(
-        key=os.getenv("RAZORPAY_KEY_SECRET", "").encode("utf-8"),
-        msg=body.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-    if expected_signature != req.razorpay_signature:
-        raise HTTPException(status_code=400, detail="Invalid payment signature")
+    _verify_checkout_signature(
+        req.razorpay_order_id, req.razorpay_payment_id, req.razorpay_signature
+    )
 
+    # The course comes from the order create-order made, not from the body.
+    order, notes = _fetch_own_order(req.razorpay_order_id, current_user.id)
     course = (
         db.query(CourseCatalog)
-        .filter(CourseCatalog.slug == req.slug)
+        .filter(CourseCatalog.slug == notes.get("course_slug"))
         .first()
     )
     if not course:
         raise HTTPException(status_code=404, detail="Course not found")
+    _require_amount(order, with_gst(float(course.price_inr or 0)) * 100)
 
     # Idempotency: if the same order has already been recorded, return success
     # without inserting a duplicate row. Razorpay can retry the handler if the
@@ -4487,19 +4513,16 @@ def create_bootcamp_order(slug: str, db: Session = Depends(get_db), current_user
 
 @app.post("/api/bootcamps/verify-payment")
 def verify_bootcamp_payment(req: BootcampVerifyRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
-    expected_signature = hmac.new(
-        key=os.getenv("RAZORPAY_KEY_SECRET", "").encode("utf-8"),
-        msg=body.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-    
-    if expected_signature != req.razorpay_signature:
-        raise HTTPException(status_code=400, detail="Invalid payment signature")
+    _verify_checkout_signature(
+        req.razorpay_order_id, req.razorpay_payment_id, req.razorpay_signature
+    )
 
-    bootcamp = db.query(BootcampCatalog).filter(BootcampCatalog.slug == req.slug).first()
+    # The bootcamp comes from the order create-order made, not from the body.
+    order, notes = _fetch_own_order(req.razorpay_order_id, current_user.id)
+    bootcamp = db.query(BootcampCatalog).filter(BootcampCatalog.slug == notes.get("bootcamp_slug")).first()
     if not bootcamp:
         raise HTTPException(status_code=404, detail="Bootcamp not found")
+    _require_amount(order, with_gst(float(bootcamp.price_inr or 0)) * 100)
 
     existing = db.query(BootcampPurchase).filter(BootcampPurchase.razorpay_order_id == req.razorpay_order_id).first()
     if existing:
@@ -4537,6 +4560,8 @@ def get_active_lab(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only view your own lab")
     row = db.query(EndLabTrial).filter(EndLabTrial.user_id == user_id).first()
     if not row:
         return None
@@ -4598,7 +4623,7 @@ async def start_lab_csfc_osf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-osf1", db)
@@ -4620,7 +4645,7 @@ async def start_lab_csfc_osf2(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-osf2", db)
@@ -4642,7 +4667,7 @@ async def start_lab_csfc_osf3(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-osf3", db)
@@ -4665,7 +4690,7 @@ async def start_lab_csfc_osf4(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-osf4", db)
@@ -4686,7 +4711,7 @@ async def start_lab_csfc_osf5(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-osf5", db)
@@ -4707,7 +4732,7 @@ async def start_lab_csfc_osf6(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-osf6", db)
@@ -4728,7 +4753,7 @@ async def start_lab_csfc_osf7(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-osf7", db)
@@ -4749,7 +4774,7 @@ async def start_lab_csfc_osf8(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-osf8", db)
@@ -4770,7 +4795,7 @@ async def start_lab_csfc_osf9(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-osf9", db)
@@ -4792,7 +4817,7 @@ async def start_lab_csfc_nf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf1", db)
@@ -4813,7 +4838,7 @@ async def start_lab_csfc_nf2(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf2", db)
@@ -4834,7 +4859,7 @@ async def start_lab_csfc_nf3(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf3", db)
@@ -4855,7 +4880,7 @@ async def start_lab_csfc_nf4(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf4", db)
@@ -4876,7 +4901,7 @@ async def start_lab_csfc_nf5(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf5", db)
@@ -4897,7 +4922,7 @@ async def start_lab_csfc_nf6(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf6", db)
@@ -4918,7 +4943,7 @@ async def start_lab_csfc_nf7(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf7", db)
@@ -4939,7 +4964,7 @@ async def start_lab_csfc_nf8(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf8", db)
@@ -4960,7 +4985,7 @@ async def start_lab_csfc_nf9(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf9", db)
@@ -4982,7 +5007,7 @@ async def start_lab_csfc_naf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-naf1", db)
@@ -5003,7 +5028,7 @@ async def start_lab_csfc_naf2(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-naf2", db)
@@ -5024,7 +5049,7 @@ async def start_lab_csfc_naf3(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-naf3", db)
@@ -5046,7 +5071,7 @@ async def start_lab_csfc_wf3(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-wf3", db)
@@ -5068,7 +5093,7 @@ async def start_lab_csfc_crf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-crf1", db)
@@ -5090,7 +5115,7 @@ async def start_lab_csfc_rtf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-rtf1", db)
@@ -5112,7 +5137,7 @@ async def start_lab_csfc_rtf2(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-rtf2", db)
@@ -5140,7 +5165,7 @@ async def start_lab_csfc_rtf3(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-rtf3", db)
@@ -5168,7 +5193,7 @@ async def start_lab_csfc_rtf4(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-rtf4", db)
@@ -5190,7 +5215,7 @@ async def start_lab_csfc_btf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-btf1", db)
@@ -5212,7 +5237,7 @@ async def start_lab_csfc_ptf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-ptf1", db)
@@ -5234,7 +5259,7 @@ async def start_lab_csfc_ptf2(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "csfc-ptf2", db)
@@ -5258,7 +5283,7 @@ async def start_lab_cutm1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "cutm1", db)
@@ -5286,7 +5311,7 @@ async def start_lab_cutm2(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "cutm2", db)
@@ -5315,7 +5340,7 @@ async def start_lab_cutm3(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "cutm3", db)
@@ -5344,7 +5369,7 @@ async def start_lab_cutm4(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "cutm4", db)
@@ -5372,7 +5397,7 @@ async def start_lab_cutm7(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "cutm7", db)
@@ -5395,7 +5420,7 @@ async def start_lab_cutm8(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "cutm8", db)
@@ -5418,7 +5443,7 @@ async def start_lab_ns_lab1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "ns-lab1", db)
@@ -5440,7 +5465,7 @@ async def start_lab_dpi_lab1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "dpi-lab1", db)
@@ -5518,7 +5543,7 @@ async def start_lab_gui_lab1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
 ):
-    uid = req.userID
+    uid = _cu.id  # the signed-in user; req.userID is ignored
     if db.query(EndLabTrial).filter(EndLabTrial.user_id == uid).first():
         raise HTTPException(400, "Another lab is currently running.")
     cost, rem = deduct_credits_or_raise(uid, "gui-lab1", db)
