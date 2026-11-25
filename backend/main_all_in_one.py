@@ -32,6 +32,8 @@ Seed first superadmin manually (see README.md).
 # IMPORTS
 # ============================================================================
 import asyncio
+import contextvars
+import functools
 import base64
 import ipaddress
 import json as _json
@@ -4247,12 +4249,82 @@ class StartLabRequest(BaseModel):
 # LAB HELPER FUNCTIONS
 # ============================================================================
 
+# Per-request record of what a lab launch has done so far, so a failure can be
+# undone: the credits charged and every EC2 instance AWS created.
+_launch_ctx: contextvars.ContextVar = contextvars.ContextVar("lab_launch_ctx", default=None)
+
+
+def _record_run_instances(parsed=None, **kwargs):
+    """boto3 hook: remember instances created during the current lab launch."""
+    ctx = _launch_ctx.get()
+    if ctx is not None and isinstance(parsed, dict):
+        ctx["instances"].extend(i["InstanceId"] for i in parsed.get("Instances", []) if i.get("InstanceId"))
+
+
 def _get_ec2_session():
-    return boto3.Session(
+    sess = boto3.Session(
         aws_access_key_id=_AWS_KEY_ID,
         aws_secret_access_key=_AWS_SECRET,
         region_name='ap-south-1',
     )
+    sess.events.register("after-call.ec2.RunInstances", _record_run_instances)
+    return sess
+
+
+def _undo_failed_launch(ctx: dict, exc: Exception) -> None:
+    """Terminate whatever the failed launch created and give the credits back."""
+    charged = ctx.get("charged")
+    instances = list(dict.fromkeys(ctx.get("instances") or []))
+    print(f"Lab launch failed for user {charged[0] if charged else '?'} "
+          f"(lab {ctx.get('lab_id')}): {type(exc).__name__}: {exc}; "
+          f"terminating {instances or 'nothing'}, refunding {charged[1] if charged else 0} credit(s)")
+    if instances:
+        _terminate_ec2(instances)
+    db = SessionLocal()
+    try:
+        if charged:
+            user_id, cost = charged
+            # A row registered just before the failure must not outlive its instances.
+            rows = db.query(EndLabTrial).filter(EndLabTrial.user_id == user_id).all()
+            for row in rows:
+                ids = set(_json.loads(row.instance_ids or "[]"))
+                if ids and ids <= set(instances):
+                    db.delete(row)
+            db.query(User).filter(User.id == user_id).update(
+                {User.available_credits: User.available_credits + cost}, synchronize_session=False,
+            )
+            db.commit()
+    except Exception as refund_exc:  # never mask the original failure
+        db.rollback()
+        print(f"REFUND FAILED for {charged}: {refund_exc}")
+    finally:
+        db.close()
+
+
+def _refund_on_failure(handler):
+    """Wrap a start-lab route: if it fails after charging credits or creating
+    instances, terminate those instances, refund the credits, and tell the user
+    plainly instead of returning a bare 500."""
+    @functools.wraps(handler)
+    async def wrapper(*args, **kwargs):
+        ctx = {"charged": None, "instances": [], "lab_id": handler.__name__}
+        token = _launch_ctx.set(ctx)
+        try:
+            return await handler(*args, **kwargs)
+        except Exception as exc:
+            if not ctx["charged"] and not ctx["instances"]:
+                raise  # failed before anything happened (e.g. 400 / 402): nothing to undo
+            _undo_failed_launch(ctx, exc)
+            refunded = ctx["charged"][1] if ctx["charged"] else 0
+            raise HTTPException(
+                status_code=502,
+                detail=(f"The lab could not be started, so your {refunded} credit"
+                        f"{'' if refunded == 1 else 's'} {'was' if refunded == 1 else 'were'} refunded. "
+                        "Please try again in a few minutes."),
+            )
+        finally:
+            _launch_ctx.reset(token)
+    return wrapper
 
 
 def deduct_credits_or_raise(user_id: int, lab_id: str, db: Session):
@@ -4271,6 +4343,10 @@ def deduct_credits_or_raise(user_id: int, lab_id: str, db: Session):
         )
     user.available_credits -= cost
     db.commit()
+    ctx = _launch_ctx.get()
+    if ctx is not None:
+        ctx["charged"] = (user_id, cost)
+        ctx["lab_id"] = lab_id
     return cost, user.available_credits
 
 
@@ -4779,6 +4855,7 @@ def extend_lab_route(
 
 # --- osf1: Windows, t2.micro, ami-05f035b6ae19778b1, duration=60 ---
 @app.post("/api/start-lab-csfc-osf1")
+@_refund_on_failure
 async def start_lab_csfc_osf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -4801,6 +4878,7 @@ async def start_lab_csfc_osf1(
 
 # --- osf2: Windows, t2.small, ami-05f035b6ae19778b1, duration=60 ---
 @app.post("/api/start-lab-csfc-osf2")
+@_refund_on_failure
 async def start_lab_csfc_osf2(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -4823,6 +4901,7 @@ async def start_lab_csfc_osf2(
 
 # --- osf3: Linux, t2.micro, ami-0e1d06225679bc1c5, 3 instances, duration=60 ---
 @app.post("/api/start-lab-csfc-osf3")
+@_refund_on_failure
 async def start_lab_csfc_osf3(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -4846,6 +4925,7 @@ async def start_lab_csfc_osf3(
 
 # --- osf4-osf9: Linux, t2.micro, ami-0e1d06225679bc1c5, single instance ---
 @app.post("/api/start-lab-csfc-osf4")
+@_refund_on_failure
 async def start_lab_csfc_osf4(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -4867,6 +4947,7 @@ async def start_lab_csfc_osf4(
 
 
 @app.post("/api/start-lab-csfc-osf5")
+@_refund_on_failure
 async def start_lab_csfc_osf5(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -4888,6 +4969,7 @@ async def start_lab_csfc_osf5(
 
 
 @app.post("/api/start-lab-csfc-osf6")
+@_refund_on_failure
 async def start_lab_csfc_osf6(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -4909,6 +4991,7 @@ async def start_lab_csfc_osf6(
 
 
 @app.post("/api/start-lab-csfc-osf7")
+@_refund_on_failure
 async def start_lab_csfc_osf7(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -4930,6 +5013,7 @@ async def start_lab_csfc_osf7(
 
 
 @app.post("/api/start-lab-csfc-osf8")
+@_refund_on_failure
 async def start_lab_csfc_osf8(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -4951,6 +5035,7 @@ async def start_lab_csfc_osf8(
 
 
 @app.post("/api/start-lab-csfc-osf9")
+@_refund_on_failure
 async def start_lab_csfc_osf9(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -4973,6 +5058,7 @@ async def start_lab_csfc_osf9(
 
 # --- nf1-nf9: Windows, t2.micro, ami-05f035b6ae19778b1 ---
 @app.post("/api/start-lab-csfc-nf1")
+@_refund_on_failure
 async def start_lab_csfc_nf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -4994,6 +5080,7 @@ async def start_lab_csfc_nf1(
 
 
 @app.post("/api/start-lab-csfc-nf2")
+@_refund_on_failure
 async def start_lab_csfc_nf2(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5015,6 +5102,7 @@ async def start_lab_csfc_nf2(
 
 
 @app.post("/api/start-lab-csfc-nf3")
+@_refund_on_failure
 async def start_lab_csfc_nf3(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5036,6 +5124,7 @@ async def start_lab_csfc_nf3(
 
 
 @app.post("/api/start-lab-csfc-nf4")
+@_refund_on_failure
 async def start_lab_csfc_nf4(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5057,6 +5146,7 @@ async def start_lab_csfc_nf4(
 
 
 @app.post("/api/start-lab-csfc-nf5")
+@_refund_on_failure
 async def start_lab_csfc_nf5(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5078,6 +5168,7 @@ async def start_lab_csfc_nf5(
 
 
 @app.post("/api/start-lab-csfc-nf6")
+@_refund_on_failure
 async def start_lab_csfc_nf6(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5099,6 +5190,7 @@ async def start_lab_csfc_nf6(
 
 
 @app.post("/api/start-lab-csfc-nf7")
+@_refund_on_failure
 async def start_lab_csfc_nf7(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5120,6 +5212,7 @@ async def start_lab_csfc_nf7(
 
 
 @app.post("/api/start-lab-csfc-nf8")
+@_refund_on_failure
 async def start_lab_csfc_nf8(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5141,6 +5234,7 @@ async def start_lab_csfc_nf8(
 
 
 @app.post("/api/start-lab-csfc-nf9")
+@_refund_on_failure
 async def start_lab_csfc_nf9(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5163,6 +5257,7 @@ async def start_lab_csfc_nf9(
 
 # --- naf1-naf3: Windows, t2.micro, ami-05f035b6ae19778b1 ---
 @app.post("/api/start-lab-csfc-naf1")
+@_refund_on_failure
 async def start_lab_csfc_naf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5184,6 +5279,7 @@ async def start_lab_csfc_naf1(
 
 
 @app.post("/api/start-lab-csfc-naf2")
+@_refund_on_failure
 async def start_lab_csfc_naf2(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5205,6 +5301,7 @@ async def start_lab_csfc_naf2(
 
 
 @app.post("/api/start-lab-csfc-naf3")
+@_refund_on_failure
 async def start_lab_csfc_naf3(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5227,6 +5324,7 @@ async def start_lab_csfc_naf3(
 
 # --- wf3: Kali Linux, t2.medium, ami-05e58d56a542aa2bf, duration=60 ---
 @app.post("/api/start-lab-csfc-wf3")
+@_refund_on_failure
 async def start_lab_csfc_wf3(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5249,6 +5347,7 @@ async def start_lab_csfc_wf3(
 
 # --- crf1: Amazon Linux, t2.micro, duration=90 ---
 @app.post("/api/start-lab-csfc-crf1")
+@_refund_on_failure
 async def start_lab_csfc_crf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5271,6 +5370,7 @@ async def start_lab_csfc_crf1(
 
 # --- rtf1: Kali Linux, t2.medium, duration=120 ---
 @app.post("/api/start-lab-csfc-rtf1")
+@_refund_on_failure
 async def start_lab_csfc_rtf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5293,6 +5393,7 @@ async def start_lab_csfc_rtf1(
 
 # --- rtf2: Mixed (Amazon Linux target + Kali attacker), duration=120 ---
 @app.post("/api/start-lab-csfc-rtf2")
+@_refund_on_failure
 async def start_lab_csfc_rtf2(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5321,6 +5422,7 @@ async def start_lab_csfc_rtf2(
 
 # --- rtf3: Mixed (Amazon Linux target + Kali attacker), duration=150 ---
 @app.post("/api/start-lab-csfc-rtf3")
+@_refund_on_failure
 async def start_lab_csfc_rtf3(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5349,6 +5451,7 @@ async def start_lab_csfc_rtf3(
 
 # --- rtf4: Kali Linux, t2.medium, duration=90 ---
 @app.post("/api/start-lab-csfc-rtf4")
+@_refund_on_failure
 async def start_lab_csfc_rtf4(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5371,6 +5474,7 @@ async def start_lab_csfc_rtf4(
 
 # --- btf1: Amazon Linux, t2.micro, duration=60 ---
 @app.post("/api/start-lab-csfc-btf1")
+@_refund_on_failure
 async def start_lab_csfc_btf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5393,6 +5497,7 @@ async def start_lab_csfc_btf1(
 
 # --- ptf1: Amazon Linux, t2.micro, duration=120 ---
 @app.post("/api/start-lab-csfc-ptf1")
+@_refund_on_failure
 async def start_lab_csfc_ptf1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5415,6 +5520,7 @@ async def start_lab_csfc_ptf1(
 
 # --- ptf2: Windows, t2.micro, no UserData, duration=120 ---
 @app.post("/api/start-lab-csfc-ptf2")
+@_refund_on_failure
 async def start_lab_csfc_ptf2(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5439,6 +5545,7 @@ async def start_lab_csfc_ptf2(
 
 # --- cutm1: Mixed (Amazon Linux + Kali), duration=150 ---
 @app.post("/api/start-lab-cutm1")
+@_refund_on_failure
 async def start_lab_cutm1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5467,6 +5574,7 @@ async def start_lab_cutm1(
 
 # --- cutm2: Mixed (Windows + Kali), duration=60 ---
 @app.post("/api/start-lab-cutm2")
+@_refund_on_failure
 async def start_lab_cutm2(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5496,6 +5604,7 @@ async def start_lab_cutm2(
 
 # --- cutm3: Mixed (Windows + Kali), duration=150 ---
 @app.post("/api/start-lab-cutm3")
+@_refund_on_failure
 async def start_lab_cutm3(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5525,6 +5634,7 @@ async def start_lab_cutm3(
 
 # --- cutm4: Mixed (Amazon Linux + Kali), duration=150 ---
 @app.post("/api/start-lab-cutm4")
+@_refund_on_failure
 async def start_lab_cutm4(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5553,6 +5663,7 @@ async def start_lab_cutm4(
 
 # --- cutm7: Linux, 3x Amazon Linux, duration=180 ---
 @app.post("/api/start-lab-cutm7")
+@_refund_on_failure
 async def start_lab_cutm7(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5576,6 +5687,7 @@ async def start_lab_cutm7(
 
 # --- cutm8: Linux, 3x Amazon Linux, duration=180 ---
 @app.post("/api/start-lab-cutm8")
+@_refund_on_failure
 async def start_lab_cutm8(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5599,6 +5711,7 @@ async def start_lab_cutm8(
 
 # --- ns-lab1: Windows, t2.micro, no UserData, duration=180 ---
 @app.post("/api/start-lab-ns-lab1")
+@_refund_on_failure
 async def start_lab_ns_lab1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5621,6 +5734,7 @@ async def start_lab_ns_lab1(
 
 # --- dpi-lab1: Mixed (Windows public + 2x Ubuntu private), special VPC, duration=180 ---
 @app.post("/api/start-lab-dpi-lab1")
+@_refund_on_failure
 async def start_lab_dpi_lab1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
@@ -5699,6 +5813,7 @@ async def start_lab_dpi_lab1(
 # Path must be "/api/start-lab-" + lab_catalog.lab_id — the frontend builds it
 # as `/start-lab-${labId}` (main-web/src/services/api.js startLab).
 @app.post("/api/start-lab-gui-lab1")
+@_refund_on_failure
 async def start_lab_gui_lab1(
     req: StartLabRequest, background_tasks: BackgroundTasks,
     db: Session = Depends(get_db), _cu: User = Depends(get_current_user),
