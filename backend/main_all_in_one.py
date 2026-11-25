@@ -33,6 +33,7 @@ Seed first superadmin manually (see README.md).
 # ============================================================================
 import asyncio
 import contextvars
+import inspect
 import functools
 import base64
 import ipaddress
@@ -4271,8 +4272,9 @@ def _get_ec2_session():
     return sess
 
 
-def _undo_failed_launch(ctx: dict, exc: Exception) -> None:
-    """Terminate whatever the failed launch created and give the credits back."""
+def _undo_failed_launch(ctx: dict, exc: Exception) -> bool:
+    """Terminate whatever the failed launch created and give the credits back.
+    Returns True if the credits were refunded (or nothing had been charged)."""
     charged = ctx.get("charged")
     instances = list(dict.fromkeys(ctx.get("instances") or []))
     print(f"Lab launch failed for user {charged[0] if charged else '?'} "
@@ -4281,6 +4283,7 @@ def _undo_failed_launch(ctx: dict, exc: Exception) -> None:
     if instances:
         _terminate_ec2(instances)
     db = SessionLocal()
+    refunded = not charged
     try:
         if charged:
             user_id, cost = charged
@@ -4294,19 +4297,37 @@ def _undo_failed_launch(ctx: dict, exc: Exception) -> None:
                 {User.available_credits: User.available_credits + cost}, synchronize_session=False,
             )
             db.commit()
+            refunded = True
     except Exception as refund_exc:  # never mask the original failure
         db.rollback()
         print(f"REFUND FAILED for {charged}: {refund_exc}")
     finally:
         db.close()
+    return refunded
 
 
 def _refund_on_failure(handler):
     """Wrap a start-lab route: if it fails after charging credits or creating
     instances, terminate those instances, refund the credits, and tell the user
-    plainly instead of returning a bare 500."""
+    plainly instead of returning a bare 500.
+
+    Labs with a Windows machine also check, before anything is charged or
+    started, that the key used to decrypt the Windows password is present.
+    Without it the launch would boot a billable instance for minutes and then
+    fail at the password step."""
+    try:
+        needs_windows_key = "_wait_windows(" in inspect.getsource(handler)
+    except (OSError, TypeError):
+        needs_windows_key = False
+
     @functools.wraps(handler)
     async def wrapper(*args, **kwargs):
+        if needs_windows_key and not os.path.isfile(_PEM_FILE):
+            print(f"Windows lab {handler.__name__} refused: key file {_PEM_FILE} is missing")
+            raise HTTPException(
+                status_code=503,
+                detail="Windows labs are temporarily unavailable. No credits were used. Please try a Linux lab.",
+            )
         ctx = {"charged": None, "instances": [], "lab_id": handler.__name__}
         token = _launch_ctx.set(ctx)
         try:
@@ -4314,16 +4335,19 @@ def _refund_on_failure(handler):
         except Exception as exc:
             if not ctx["charged"] and not ctx["instances"]:
                 raise  # failed before anything happened (e.g. 400 / 402): nothing to undo
-            _undo_failed_launch(ctx, exc)
-            refunded = ctx["charged"][1] if ctx["charged"] else 0
-            raise HTTPException(
-                status_code=502,
-                detail=(f"The lab could not be started, so your {refunded} credit"
-                        f"{'' if refunded == 1 else 's'} {'was' if refunded == 1 else 'were'} refunded. "
-                        "Please try again in a few minutes."),
-            )
+            refunded_ok = _undo_failed_launch(ctx, exc)
+            cost = ctx["charged"][1] if ctx["charged"] else 0
+            if refunded_ok:
+                detail = (f"The lab could not be started, so your {cost} credit"
+                          f"{'' if cost == 1 else 's'} {'was' if cost == 1 else 'were'} refunded. "
+                          "Please try again in a few minutes.")
+            else:
+                detail = ("The lab could not be started and the automatic refund did not go through. "
+                          "Please contact support so we can return your credits.")
+            raise HTTPException(status_code=502, detail=detail)
         finally:
             _launch_ctx.reset(token)
+    wrapper.needs_windows_key = needs_windows_key
     return wrapper
 
 
