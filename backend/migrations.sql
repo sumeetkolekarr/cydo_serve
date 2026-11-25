@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
+-- Used by signup and the profile API; added by hand on prod long ago, missing here until 2026-11-25.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS country VARCHAR;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR;
 
 -- 2. Subscriptions
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -654,8 +657,7 @@ CREATE TABLE IF NOT EXISTS assessment_attempts (
     total_questions INTEGER,
     answers_payload JSONB,
     violations INTEGER DEFAULT 0,
-    status VARCHAR(20) DEFAULT 'in_progress',
-    UNIQUE(assessment_id, user_id)
+    status VARCHAR(20) DEFAULT 'in_progress'
 );
 
 CREATE TABLE IF NOT EXISTS assessment_violations (
@@ -773,6 +775,25 @@ BEGIN
 
     END IF;
 END $$;
+
+-- ------------------------------------------------------------
+-- Assessments v2 (2026-11-25): retakes with history, pass mark,
+-- LMS semester linking. Idempotent like the rest of this file.
+-- ------------------------------------------------------------
+-- Retakes: every attempt is kept, so (assessment, user) is no longer unique.
+-- The inline UNIQUE above was auto-named by Postgres; the ORM used another name.
+ALTER TABLE assessment_attempts DROP CONSTRAINT IF EXISTS assessment_attempts_assessment_id_user_id_key;
+ALTER TABLE assessment_attempts DROP CONSTRAINT IF EXISTS _asmt_user_uc;
+ALTER TABLE assessment_attempts ADD COLUMN IF NOT EXISTS attempt_number INTEGER DEFAULT 1;
+CREATE INDEX IF NOT EXISTS ix_assessment_attempts_asmt_user ON assessment_attempts (assessment_id, user_id);
+
+-- Pass mark shown to candidates and used in admin results.
+ALTER TABLE assessments ADD COLUMN IF NOT EXISTS pass_percentage INTEGER DEFAULT 70;
+-- NULL = public (listed on /learn). Set = shown in that semester's LMS and
+-- restricted to enrolled, paid students of that university/program.
+ALTER TABLE assessments ADD COLUMN IF NOT EXISTS semester_id INTEGER
+    REFERENCES university_semesters(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS ix_assessments_semester ON assessments (semester_id);
 
 -- ============================================================
 -- SEED FIRST SUPERADMIN

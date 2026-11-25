@@ -409,6 +409,11 @@ class Assessment(Base):
     time_limit_minutes = Column(Integer, default=15)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=sqlfunc.now())
+    # Score (percent) needed to pass; shown to candidates and used in results.
+    pass_percentage = Column(Integer, default=70)
+    # NULL = public (listed on /learn). Set = belongs to that LMS semester and is
+    # restricted to that semester's enrolled, paid students.
+    semester_id = Column(Integer, ForeignKey("university_semesters.id", ondelete="SET NULL"), nullable=True, index=True)
 
 
 class AssessmentQuestion(Base):
@@ -433,8 +438,10 @@ class AssessmentAttempt(Base):
     total_questions = Column(Integer)
     answers_payload = Column(JSONB)
     violations = Column(Integer, default=0)
+    # in_progress | completed | expired (time ran out before a submit arrived)
     status = Column(String(20), default="in_progress")
-    __table_args__ = (UniqueConstraint("assessment_id", "user_id", name="_asmt_user_uc"),)
+    # Candidates may retake: every attempt is kept and numbered 1, 2, 3, ...
+    attempt_number = Column(Integer, default=1)
 
 
 class AssessmentViolation(Base):
@@ -1062,6 +1069,27 @@ VALID_CONTACT_STATUSES = {"unread", "read", "replied", "dismissed"}
 
 class AssessmentAnswerSubmit(BaseModel):
     answers: dict  # {str(question_id): list[int]}
+    attempt_id: Optional[int] = None
+
+
+class AdminAssessmentQuestionIn(BaseModel):
+    question_text: str
+    options: List[str]
+    correct_answers: List[int]   # indexes into options
+    multi_select: bool = False
+
+
+class AdminAssessmentIn(BaseModel):
+    title: str
+    slug: str
+    description: Optional[str] = None
+    topic: Optional[str] = None
+    difficulty: str = "mixed"
+    time_limit_minutes: int = 15
+    pass_percentage: int = 70
+    is_active: bool = True
+    semester_id: Optional[int] = None
+    questions: List[AdminAssessmentQuestionIn]
 
 
 class AssessmentViolationLog(BaseModel):
@@ -3196,6 +3224,8 @@ def _assessment_row(a: Assessment):
         "description": a.description, "topic": a.topic,
         "difficulty": a.difficulty, "time_limit_minutes": a.time_limit_minutes,
         "is_active": a.is_active,
+        "pass_percentage": a.pass_percentage if a.pass_percentage is not None else 70,
+        "semester_id": a.semester_id,
     }
 
 
@@ -3574,6 +3604,17 @@ def get_my_lms(current_user: User = Depends(get_current_user), db: Session = Dep
     else:
         sem_q = sem_q.filter(UniversitySemester.university_id == us.university_id)
     sem = sem_q.first()
+    # Assessments linked to this semester; only for students who have paid.
+    sem_assessments = []
+    if sem and us.lms_paid:
+        for a in (db.query(Assessment)
+                  .filter(Assessment.semester_id == sem.id, Assessment.is_active == True)
+                  .order_by(Assessment.id).all()):
+            sem_assessments.append({
+                **_assessment_row(a),
+                "question_count": db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == a.id).count(),
+                "my_attempts": _attempt_summary(_user_attempts(db, a, current_user.id), a),
+            })
     return {
         "enrolled": True,
         "lms_paid": us.lms_paid,
@@ -3582,6 +3623,7 @@ def get_my_lms(current_user: User = Depends(get_current_user), db: Session = Dep
         "university": _uni_row(uni) if uni else None,
         "program": _prog_row(prog) if prog else None,
         "semester": _sem_row(sem) if sem else None,
+        "assessments": sem_assessments,
     }
 
 @app.post("/api/lms/create-order")
@@ -5724,62 +5766,236 @@ def admin_check_semester_links(
 # ============================================================================
 # ASSESSMENTS
 # ============================================================================
+# Candidates may retake an assessment as often as they like. Every attempt is
+# kept (attempt_number 1, 2, ...) so a returning candidate sees their previous
+# scores before starting again, and admins see the full history. The server,
+# not the browser, enforces the time limit and one submission per attempt.
+# Questions are only sent when an attempt starts, so the clock covers all the
+# time a candidate can see them.
+
+ASSESSMENT_SUBMIT_GRACE_SECONDS = 60   # slack for the browser's auto-submit at 0:00
+ASSESSMENT_DIFFICULTIES = {"easy", "medium", "hard", "mixed"}
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _as_aware(dt):
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _attempt_deadline(att: AssessmentAttempt, a: Assessment):
+    return _as_aware(att.started_at) + timedelta(minutes=a.time_limit_minutes or 0)
+
+
+def _pct(score, total):
+    return round((score or 0) / total * 100) if total else 0
+
+
+def _attempt_row(att: AssessmentAttempt, a: Assessment):
+    pct = _pct(att.score, att.total_questions) if att.status == "completed" else None
+    pass_mark = a.pass_percentage if a.pass_percentage is not None else 70
+    return {
+        "id": att.id,
+        "attempt_number": att.attempt_number or 1,
+        "status": att.status,
+        "score": att.score,
+        "total_questions": att.total_questions,
+        "percentage": pct,
+        "passed": pct is not None and pct >= pass_mark,
+        "violations": att.violations or 0,
+        "started_at": _iso_z(att.started_at),
+        "completed_at": _iso_z(att.completed_at),
+    }
+
+
+def _expire_if_overdue(db: Session, att: AssessmentAttempt, a: Assessment) -> bool:
+    """Close an in-progress attempt whose time has run out. True if it was closed."""
+    if att.status != "in_progress":
+        return False
+    if _utcnow() <= _attempt_deadline(att, a) + timedelta(seconds=ASSESSMENT_SUBMIT_GRACE_SECONDS):
+        return False
+    att.status = "expired"
+    att.completed_at = _attempt_deadline(att, a)
+    db.commit()
+    return True
+
+
+def _user_attempts(db: Session, a: Assessment, user_id: int):
+    """All of a user's attempts at an assessment, newest first."""
+    return (
+        db.query(AssessmentAttempt)
+        .filter(AssessmentAttempt.assessment_id == a.id, AssessmentAttempt.user_id == user_id)
+        .order_by(AssessmentAttempt.id.desc())
+        .all()
+    )
+
+
+def _attempt_summary(attempts, a: Assessment):
+    done = [x for x in attempts if x.status == "completed"]
+    last = done[0] if done else None
+    best = max(done, key=lambda x: (_pct(x.score, x.total_questions), -x.id)) if done else None
+    return {
+        "attempts_count": len(done),
+        "last": _attempt_row(last, a) if last else None,
+        "best": _attempt_row(best, a) if best else None,
+    }
+
+
+def _current_attempt(db: Session, attempts, a: Assessment):
+    """The user's still-running attempt, after expiring any that are overdue."""
+    for att in attempts:
+        if att.status == "in_progress" and not _expire_if_overdue(db, att, a):
+            return att
+    return None
+
+
+def _seconds_left(att: AssessmentAttempt, a: Assessment) -> int:
+    return max(0, int((_attempt_deadline(att, a) - _utcnow()).total_seconds()))
+
+
+def _require_assessment_access(db: Session, a: Assessment, user: User):
+    """Semester-linked assessments are only for that semester's paid students."""
+    if not a.semester_id:
+        return
+    sem = db.query(UniversitySemester).filter(UniversitySemester.id == a.semester_id).first()
+    allowed = False
+    if sem:
+        q = db.query(UniversityStudent).filter(
+            UniversityStudent.user_id == user.id,
+            UniversityStudent.university_id == sem.university_id,
+            UniversityStudent.lms_paid == True,
+        )
+        if sem.program_id:
+            q = q.filter(UniversityStudent.program_id == sem.program_id)
+        allowed = q.first() is not None
+    if not allowed:
+        raise HTTPException(status_code=403, detail="This assessment is only available to enrolled LMS students")
+
+
+def _active_assessment_or_404(db: Session, slug: str) -> Assessment:
+    a = db.query(Assessment).filter(Assessment.slug == slug, Assessment.is_active == True).first()
+    if not a:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    return a
+
+
+def _questions_of(db: Session, a: Assessment):
+    return (
+        db.query(AssessmentQuestion)
+        .filter(AssessmentQuestion.assessment_id == a.id)
+        .order_by(AssessmentQuestion.order_num, AssessmentQuestion.id)
+        .all()
+    )
+
+
+def _semester_label(db: Session, semester_id):
+    if not semester_id:
+        return None
+    sem = db.query(UniversitySemester).filter(UniversitySemester.id == semester_id).first()
+    if not sem:
+        return None
+    uni = db.query(University).filter(University.id == sem.university_id).first()
+    prog = db.query(UniversityProgram).filter(UniversityProgram.id == sem.program_id).first() if sem.program_id else None
+    parts = [uni.name if uni else f"University {sem.university_id}"]
+    if prog:
+        parts.append(prog.name)
+    parts.append(f"Semester {sem.semester_number}" + (f" ({sem.name})" if sem.name else ""))
+    return " / ".join(parts)
+
+
 @app.get("/api/assessments")
 def list_assessments(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = db.query(Assessment).filter(Assessment.is_active == True).all()
-    return [_assessment_row(a) for a in rows]
+    """Public assessments (not tied to an LMS semester) with the caller's history."""
+    rows = (
+        db.query(Assessment)
+        .filter(Assessment.is_active == True, Assessment.semester_id == None)
+        .order_by(Assessment.id)
+        .all()
+    )
+    return [
+        {
+            **_assessment_row(a),
+            "question_count": db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == a.id).count(),
+            "my_attempts": _attempt_summary(_user_attempts(db, a, user.id), a),
+        }
+        for a in rows
+    ]
 
 
 @app.get("/api/assessments/{slug}")
 def get_assessment(slug: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    a = db.query(Assessment).filter(Assessment.slug == slug, Assessment.is_active == True).first()
-    if not a:
-        raise HTTPException(status_code=404, detail="Assessment not found")
-    questions = (
-        db.query(AssessmentQuestion)
-        .filter(AssessmentQuestion.assessment_id == a.id)
-        .order_by(AssessmentQuestion.order_num)
-        .all()
-    )
-    attempt = db.query(AssessmentAttempt).filter(
-        AssessmentAttempt.assessment_id == a.id,
-        AssessmentAttempt.user_id == user.id,
-    ).first()
+    """Assessment overview and the caller's previous attempts. No questions here:
+    they are returned by /start, when the clock begins."""
+    a = _active_assessment_or_404(db, slug)
+    _require_assessment_access(db, a, user)
+    attempts = _user_attempts(db, a, user.id)
+    current = _current_attempt(db, attempts, a)
     return {
         **_assessment_row(a),
-        "questions": [_question_row(q) for q in questions],
-        "attempt": {
-            "id": attempt.id,
-            "status": attempt.status,
-            "score": attempt.score,
-            "total_questions": attempt.total_questions,
-            "violations": attempt.violations,
-        } if attempt else None,
+        "question_count": db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == a.id).count(),
+        "attempts": [_attempt_row(x, a) for x in attempts if x.status != "in_progress"],
+        "summary": _attempt_summary(attempts, a),
+        "in_progress": {
+            "attempt_id": current.id,
+            "attempt_number": current.attempt_number or 1,
+            "started_at": _iso_z(current.started_at),
+            "seconds_left": _seconds_left(current, a),
+        } if current else None,
     }
 
 
 @app.post("/api/assessments/{slug}/start")
 def start_assessment(slug: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    a = db.query(Assessment).filter(Assessment.slug == slug, Assessment.is_active == True).first()
-    if not a:
-        raise HTTPException(status_code=404, detail="Assessment not found")
-    existing = db.query(AssessmentAttempt).filter(
-        AssessmentAttempt.assessment_id == a.id,
-        AssessmentAttempt.user_id == user.id,
-    ).first()
-    if existing:
-        return {"attempt_id": existing.id, "status": existing.status, "score": existing.score}
-    total = db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == a.id).count()
-    attempt = AssessmentAttempt(
-        assessment_id=a.id,
-        user_id=user.id,
-        total_questions=total,
-        status="in_progress",
-    )
-    db.add(attempt)
-    db.commit()
-    db.refresh(attempt)
-    return {"attempt_id": attempt.id, "status": attempt.status, "score": None}
+    """Resume the running attempt, or begin a new one. Returns the questions
+    (never the answers) and the seconds left on the server's clock."""
+    a = _active_assessment_or_404(db, slug)
+    _require_assessment_access(db, a, user)
+    questions = _questions_of(db, a)
+    if not questions:
+        raise HTTPException(status_code=400, detail="This assessment has no questions yet")
+    attempts = _user_attempts(db, a, user.id)
+    current = _current_attempt(db, attempts, a)
+    resumed = current is not None
+    if not current:
+        next_number = max([x.attempt_number or 1 for x in attempts], default=0) + 1
+        current = AssessmentAttempt(
+            assessment_id=a.id,
+            user_id=user.id,
+            total_questions=len(questions),
+            status="in_progress",
+            attempt_number=next_number,
+            started_at=_utcnow(),
+        )
+        db.add(current)
+        db.commit()
+        db.refresh(current)
+    return {
+        "attempt_id": current.id,
+        "attempt_number": current.attempt_number or 1,
+        "resumed": resumed,
+        "seconds_left": _seconds_left(current, a),
+        "time_limit_minutes": a.time_limit_minutes,
+        "violations": current.violations or 0,
+        "questions": [_question_row(q) for q in questions],
+        "summary": _attempt_summary(attempts, a),
+    }
+
+
+def _clean_answer(value):
+    """A submitted answer as a sorted list of unique ints; junk is ignored."""
+    if not isinstance(value, list):
+        value = [value]
+    out = set()
+    for v in value:
+        try:
+            out.add(int(v))
+        except (TypeError, ValueError):
+            continue
+    return sorted(out)
 
 
 @app.post("/api/assessments/{slug}/submit")
@@ -5787,29 +6003,53 @@ def submit_assessment(slug: str, req: AssessmentAnswerSubmit, user: User = Depen
     a = db.query(Assessment).filter(Assessment.slug == slug).first()
     if not a:
         raise HTTPException(status_code=404, detail="Assessment not found")
-    attempt = db.query(AssessmentAttempt).filter(
+    _require_assessment_access(db, a, user)
+    q = db.query(AssessmentAttempt).filter(
         AssessmentAttempt.assessment_id == a.id,
         AssessmentAttempt.user_id == user.id,
-    ).first()
-    if not attempt:
-        raise HTTPException(status_code=400, detail="No attempt started")
-    questions = db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == a.id).all()
+        AssessmentAttempt.status == "in_progress",
+    )
+    if req.attempt_id is not None:
+        q = q.filter(AssessmentAttempt.id == req.attempt_id)
+    # Row lock: a double-click cannot score the same attempt twice.
+    att = q.order_by(AssessmentAttempt.id.desc()).with_for_update().first()
+    if not att:
+        raise HTTPException(
+            status_code=409,
+            detail="No attempt in progress. This attempt was already submitted; start the assessment again to retake it.",
+        )
+    deadline = _attempt_deadline(att, a)
+    if _utcnow() > deadline + timedelta(seconds=ASSESSMENT_SUBMIT_GRACE_SECONDS):
+        att.status = "expired"
+        att.completed_at = deadline
+        db.commit()
+        raise HTTPException(status_code=400, detail="Time is up: this attempt passed its time limit and was not scored.")
+
+    questions = _questions_of(db, a)
+    answers = req.answers or {}
     score = 0
-    for q in questions:
-        submitted = req.answers.get(str(q.id), [])
-        if sorted(submitted) == sorted(q.correct_answers):
+    for qq in questions:
+        if _clean_answer(answers.get(str(qq.id), [])) == sorted(qq.correct_answers or []):
             score += 1
-    attempt.score = score
-    attempt.total_questions = len(questions)
-    attempt.answers_payload = req.answers
-    attempt.status = "completed"
-    attempt.completed_at = sqlfunc.now()
+    att.score = score
+    att.total_questions = len(questions)
+    att.answers_payload = {str(k): _clean_answer(v) for k, v in answers.items()}
+    att.status = "completed"
+    att.completed_at = _utcnow()
     db.commit()
+
+    attempts = _user_attempts(db, a, user.id)
+    row = _attempt_row(att, a)
     return {
+        "attempt_id": att.id,
+        "attempt_number": att.attempt_number or 1,
         "score": score,
         "total": len(questions),
-        "percentage": round(score / len(questions) * 100) if questions else 0,
-        "violations": attempt.violations,
+        "percentage": row["percentage"],
+        "passed": row["passed"],
+        "pass_percentage": a.pass_percentage if a.pass_percentage is not None else 70,
+        "violations": att.violations or 0,
+        "summary": _attempt_summary(attempts, a),
     }
 
 
@@ -5821,15 +6061,198 @@ def log_violation(req: AssessmentViolationLog, user: User = Depends(get_current_
     ).first()
     if not attempt:
         raise HTTPException(status_code=404, detail="Attempt not found")
-    v = AssessmentViolation(
+    if attempt.status != "in_progress":
+        return {"violations": attempt.violations or 0}
+    db.add(AssessmentViolation(
         attempt_id=attempt.id,
         user_id=user.id,
-        violation_type=req.violation_type,
-    )
-    db.add(v)
+        violation_type=(req.violation_type or "tab_switch")[:50],
+    ))
     attempt.violations = (attempt.violations or 0) + 1
     db.commit()
     return {"violations": attempt.violations}
+
+
+# ---------------------------------------------------------------- admin
+
+def _validated_assessment(req: AdminAssessmentIn, db: Session, existing_id=None) -> dict:
+    title = (req.title or "").strip()
+    slug = (req.slug or "").strip().lower()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,98}", slug):
+        raise HTTPException(status_code=400, detail="Slug must be 2-99 characters: lowercase letters, digits and hyphens")
+    clash = db.query(Assessment).filter(Assessment.slug == slug)
+    if existing_id is not None:
+        clash = clash.filter(Assessment.id != existing_id)
+    if clash.first():
+        raise HTTPException(status_code=409, detail="An assessment with this slug already exists")
+    difficulty = (req.difficulty or "mixed").strip().lower()
+    if difficulty not in ASSESSMENT_DIFFICULTIES:
+        raise HTTPException(status_code=400, detail="Difficulty must be easy, medium, hard or mixed")
+    if not 1 <= int(req.time_limit_minutes) <= 300:
+        raise HTTPException(status_code=400, detail="Time limit must be between 1 and 300 minutes")
+    if not 0 <= int(req.pass_percentage) <= 100:
+        raise HTTPException(status_code=400, detail="Pass percentage must be between 0 and 100")
+    if req.semester_id is not None and not db.query(UniversitySemester).filter(UniversitySemester.id == req.semester_id).first():
+        raise HTTPException(status_code=400, detail="Selected LMS semester does not exist")
+    if not req.questions:
+        raise HTTPException(status_code=400, detail="Add at least one question")
+    questions = []
+    for i, q in enumerate(req.questions, start=1):
+        text = (q.question_text or "").strip()
+        options = [str(o).strip() for o in (q.options or [])]
+        if not text:
+            raise HTTPException(status_code=400, detail=f"Question {i}: text is required")
+        if len(options) < 2 or any(not o for o in options):
+            raise HTTPException(status_code=400, detail=f"Question {i}: needs at least two non-empty options")
+        if len(options) > 10:
+            raise HTTPException(status_code=400, detail=f"Question {i}: at most 10 options")
+        correct = sorted(set(q.correct_answers or []))
+        if not correct or any(c < 0 or c >= len(options) for c in correct):
+            raise HTTPException(status_code=400, detail=f"Question {i}: mark at least one valid correct option")
+        if not q.multi_select and len(correct) != 1:
+            raise HTTPException(status_code=400, detail=f"Question {i}: single-answer questions need exactly one correct option")
+        questions.append({
+            "question_text": text, "options": options,
+            "correct_answers": correct, "multi_select": bool(q.multi_select), "order_num": i,
+        })
+    return {
+        "fields": {
+            "title": title, "slug": slug,
+            "description": (req.description or "").strip() or None,
+            "topic": (req.topic or "").strip() or None,
+            "difficulty": difficulty,
+            "time_limit_minutes": int(req.time_limit_minutes),
+            "pass_percentage": int(req.pass_percentage),
+            "is_active": bool(req.is_active),
+            "semester_id": req.semester_id,
+        },
+        "questions": questions,
+    }
+
+
+def _admin_assessment_stats(db: Session, a: Assessment) -> dict:
+    attempts = db.query(AssessmentAttempt).filter(AssessmentAttempt.assessment_id == a.id).all()
+    done = [x for x in attempts if x.status == "completed"]
+    pass_mark = a.pass_percentage if a.pass_percentage is not None else 70
+    pcts = [_pct(x.score, x.total_questions) for x in done]
+    return {
+        "question_count": db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == a.id).count(),
+        "candidates": len({x.user_id for x in attempts}),
+        "completed_attempts": len(done),
+        "avg_percentage": round(sum(pcts) / len(pcts)) if pcts else None,
+        "pass_rate": round(sum(1 for p in pcts if p >= pass_mark) / len(pcts) * 100) if pcts else None,
+    }
+
+
+def _admin_assessment_row(db: Session, a: Assessment) -> dict:
+    return {
+        **_assessment_row(a),
+        "semester_label": _semester_label(db, a.semester_id),
+        "created_at": _iso_z(a.created_at),
+        **_admin_assessment_stats(db, a),
+    }
+
+
+def _admin_assessment_or_404(db: Session, aid: int) -> Assessment:
+    a = db.query(Assessment).filter(Assessment.id == aid).first()
+    if not a:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    return a
+
+
+@app.get("/api/admin/assessment-semesters")
+def admin_assessment_semesters(admin: Admin = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """LMS semesters an assessment can be linked to (for the form's dropdown)."""
+    sems = db.query(UniversitySemester).order_by(
+        UniversitySemester.university_id, UniversitySemester.program_id, UniversitySemester.semester_number
+    ).all()
+    return [{"id": s.id, "label": _semester_label(db, s.id)} for s in sems]
+
+
+@app.get("/api/admin/assessments")
+def admin_list_assessments(admin: Admin = Depends(get_current_admin), db: Session = Depends(get_db)):
+    rows = db.query(Assessment).order_by(Assessment.id.desc()).all()
+    return [_admin_assessment_row(db, a) for a in rows]
+
+
+@app.get("/api/admin/assessments/{aid}")
+def admin_get_assessment(aid: int, admin: Admin = Depends(get_current_admin), db: Session = Depends(get_db)):
+    a = _admin_assessment_or_404(db, aid)
+    return {
+        **_admin_assessment_row(db, a),
+        "questions": [_question_row(q, include_answers=True) for q in _questions_of(db, a)],
+    }
+
+
+@app.post("/api/admin/assessments")
+def admin_create_assessment(req: AdminAssessmentIn, admin: Admin = Depends(get_current_admin), db: Session = Depends(get_db)):
+    data = _validated_assessment(req, db)
+    a = Assessment(**data["fields"])
+    db.add(a)
+    db.flush()
+    for q in data["questions"]:
+        db.add(AssessmentQuestion(assessment_id=a.id, **q))
+    db.commit()
+    db.refresh(a)
+    write_audit(db, admin.id, "create", "assessment", a.id, None,
+                {**data["fields"], "question_count": len(data["questions"])})
+    return _admin_assessment_row(db, a)
+
+
+@app.put("/api/admin/assessments/{aid}")
+def admin_update_assessment(aid: int, req: AdminAssessmentIn, admin: Admin = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """Replace an assessment's settings and its full question list. Past attempts
+    keep their recorded scores."""
+    a = _admin_assessment_or_404(db, aid)
+    data = _validated_assessment(req, db, existing_id=a.id)
+    before = {**_assessment_row(a), "question_count": len(_questions_of(db, a))}
+    for k, v in data["fields"].items():
+        setattr(a, k, v)
+    db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == a.id).delete()
+    for q in data["questions"]:
+        db.add(AssessmentQuestion(assessment_id=a.id, **q))
+    db.commit()
+    db.refresh(a)
+    write_audit(db, admin.id, "update", "assessment", a.id, before,
+                {**data["fields"], "question_count": len(data["questions"])})
+    return _admin_assessment_row(db, a)
+
+
+@app.delete("/api/admin/assessments/{aid}")
+def admin_deactivate_assessment(aid: int, admin: Admin = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """Soft delete: hides the assessment from candidates, keeps all results."""
+    a = _admin_assessment_or_404(db, aid)
+    a.is_active = False
+    db.commit()
+    write_audit(db, admin.id, "deactivate", "assessment", a.id, {"is_active": True}, {"is_active": False})
+    return {"success": True}
+
+
+@app.get("/api/admin/assessments/{aid}/results")
+def admin_assessment_results(aid: int, admin: Admin = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """Every attempt by every candidate, newest first, plus summary figures."""
+    a = _admin_assessment_or_404(db, aid)
+    rows = (
+        db.query(AssessmentAttempt, User)
+        .join(User, User.id == AssessmentAttempt.user_id)
+        .filter(AssessmentAttempt.assessment_id == a.id)
+        .order_by(AssessmentAttempt.id.desc())
+        .all()
+    )
+    attempts = []
+    for att, u in rows:
+        if att.status == "in_progress":
+            _expire_if_overdue(db, att, a)
+        attempts.append({
+            **_attempt_row(att, a),
+            "user_id": u.id, "email": u.email, "full_name": u.full_name,
+        })
+    return {
+        "assessment": _admin_assessment_row(db, a),
+        "attempts": attempts,
+    }
 
 
 # ============================================================================
