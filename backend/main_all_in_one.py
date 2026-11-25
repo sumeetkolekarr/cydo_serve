@@ -141,6 +141,19 @@ class Subscription(Base):
     current_period_end = Column(DateTime(timezone=True), nullable=True)
 
 
+class SubscriptionCreditGrant(Base):
+    """One row per credit grant from a subscription. grant_key is unique, so a
+    month (annual plans) or a Razorpay payment (monthly plans) can never be
+    credited twice, however many times a webhook or page load triggers it."""
+    __tablename__ = "subscription_credit_grants"
+    id = Column(Integer, primary_key=True, index=True)
+    subscription_id = Column(Integer, ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    grant_key = Column(String(120), unique=True, nullable=False)
+    credits = Column(Integer, nullable=False)
+    granted_at = Column(DateTime(timezone=True), server_default=sqlfunc.now())
+
+
 class SubscriptionEvent(Base):
     __tablename__ = "subscription_events"
     id = Column(Integer, primary_key=True, index=True)
@@ -695,6 +708,17 @@ RAZORPAY_PLAN_IDS = {
 # 60 monthly cycles = 5 yrs; 5 annual cycles = 5 yrs. Tune later if needed.
 RAZORPAY_TOTAL_COUNT = {"monthly": 60, "annual": 5}
 
+# A subscription is a credit plan: it adds these credits every month. Monthly
+# plans are credited when each month is paid; annual plans get the same amount
+# every month of the paid year (a monthly drip, not one lump sum).
+SUBSCRIPTION_MONTHLY_CREDITS = {"Basic": 20, "Pro": 50, "Premium": 100}
+
+
+def _subscriptions_configured() -> bool:
+    """True once every Razorpay plan id and the webhook secret are real values."""
+    values = list(RAZORPAY_PLAN_IDS.values()) + [RAZORPAY_WEBHOOK_SECRET]
+    return all(v and "PLACEHOLDER" not in v.upper() for v in values)
+
 # GST applied to every customer-facing rupee amount. Mirrors GST_RATE in
 # main-web/src/utils/pricing.js — keep both in sync. Same rounding rule
 # (half-away-from-zero) on both sides so server validation never rejects a
@@ -820,7 +844,7 @@ class SubVerifyPayment(BaseModel):
 
 # Razorpay Subscriptions API (recurring) schemas
 class SubCreateRecurring(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None  # ignored: the signed-in user subscribes
     plan_name: str
     billing_cycle: str
 
@@ -829,7 +853,7 @@ class SubVerifyInitial(BaseModel):
     razorpay_payment_id: str
     razorpay_subscription_id: str
     razorpay_signature: str
-    user_id: int
+    user_id: Optional[int] = None  # ignored: the signed-in user is used
 
 
 class SubUpgradeRequest(BaseModel):
@@ -1260,6 +1284,7 @@ def get_profile(
 ):
     if user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Cannot view another user's profile")
+    _settle_subscription_credits(db, user_id)
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1470,14 +1495,16 @@ def get_credit_history(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """User-visible purchase history. `type=credit` excludes subscription receipts."""
+    """User-visible purchase history. `type=credit` excludes subscription receipts.
+    Monthly subscription credit grants appear as type "subscription_credits"."""
+    _settle_subscription_credits(db, current_user.id)
     q = db.query(CreditTransaction).filter(CreditTransaction.user_id == current_user.id)
     if type == "credit":
         q = q.filter(~CreditTransaction.plan_name.like("sub:%"))
     elif type == "subscription":
         q = q.filter(CreditTransaction.plan_name.like("sub:%"))
     rows = q.order_by(CreditTransaction.purchased_at.desc()).limit(200).all()
-    return [
+    out = [
         {
             "id": r.id,
             "plan_name": r.plan_name,
@@ -1488,6 +1515,28 @@ def get_credit_history(
         }
         for r in rows
     ]
+    if type in ("all", "subscription"):
+        grants = (
+            db.query(SubscriptionCreditGrant, Subscription.plan_name)
+            .join(Subscription, Subscription.id == SubscriptionCreditGrant.subscription_id)
+            .filter(SubscriptionCreditGrant.user_id == current_user.id)
+            .order_by(SubscriptionCreditGrant.id.desc())
+            .limit(200)
+            .all()
+        )
+        out += [
+            {
+                "id": f"grant-{g.id}",
+                "plan_name": f"{plan} subscription credits",
+                "credits_added": g.credits,
+                "amount_paid": 0.0,
+                "purchased_at": _iso_z(g.granted_at),
+                "type": "subscription_credits",
+            }
+            for g, plan in grants
+        ]
+        out.sort(key=lambda r: r["purchased_at"] or "", reverse=True)
+    return out[:200]
 
 
 @app.post("/api/credits/verify-payment")
@@ -1595,67 +1644,10 @@ def verify_and_credit(
 # ============================================================================
 # USER-FACING ROUTES: SUBSCRIPTIONS
 # ============================================================================
-@app.post("/api/subscriptions/create-order")
-def create_subscription_order(req: SubCreateOrder, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.id == req.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    order = razorpay_client.order.create({
-        "amount": req.amount,
-        "currency": "INR",
-        "receipt": f"sub_{req.user_id}_{req.plan_name}_{req.billing_cycle}",
-        "notes": {
-            "user_id": str(req.user_id),
-            "plan_name": req.plan_name,
-            "billing_cycle": req.billing_cycle,
-            "type": "subscription",
-        },
-    })
-    return {"order_id": order["id"], "amount": req.amount, "currency": "INR"}
-
-
-@app.post("/api/subscriptions/verify-payment")
-def verify_subscription_payment(req: SubVerifyPayment, db: Session = Depends(get_db)):
-    body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
-    expected_signature = hmac.new(
-        key=os.getenv("RAZORPAY_KEY_SECRET", "").encode("utf-8"),
-        msg=body.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-    if expected_signature != req.razorpay_signature:
-        raise HTTPException(status_code=400, detail="Invalid payment signature")
-
-    user = db.query(User).filter(User.id == req.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    db.query(Subscription).filter(
-        Subscription.user_id == req.user_id, Subscription.is_active == True
-    ).update({"is_active": False})
-
-    start_date = datetime.utcnow()
-    end_date = start_date + (
-        timedelta(days=365) if req.billing_cycle == "annual" else timedelta(days=30)
-    )
-    new_sub = Subscription(
-        user_id=user.id,
-        plan_name=req.plan_name,
-        billing_cycle=req.billing_cycle,
-        start_date=start_date,
-        end_date=end_date,
-    )
-    db.add(new_sub)
-
-    txn = CreditTransaction(
-        user_id=req.user_id,
-        plan_name=f"sub:{req.plan_name}",
-        credits_added=0,
-        amount_paid=req.amount,
-    )
-    db.add(txn)
-    db.commit()
-    return {"message": "Subscription activated successfully", "expires_on": end_date.isoformat()}
-
+# /api/subscriptions/create-order and /verify-payment (legacy one-shot
+# subscriptions) were removed on 2026-11-25. They took the user and price from
+# the request body without a login; once subscriptions grant credits that would
+# let anyone buy credits for any amount. Subscriptions use the recurring flow.
 
 # /api/subscriptions/subscribe (a legacy free-tier path with no login and no
 # payment, which let anyone activate any plan for any user) was removed on
@@ -1675,26 +1667,114 @@ def _from_rzp_ts(ts):
         return None
 
 
+def _add_months(dt, n: int):
+    """dt plus n calendar months, clamping the day (31 Jan + 1 month = 28/29 Feb)."""
+    import calendar
+    month0 = dt.month - 1 + n
+    year, month = dt.year + month0 // 12, month0 % 12 + 1
+    return dt.replace(year=year, month=month, day=min(dt.day, calendar.monthrange(year, month)[1]))
+
+
+def _grant_subscription_credits(db: Session, sub: "Subscription", grant_key: str) -> int:
+    """Add one month of the plan's credits, once per grant_key. Returns credits added."""
+    credits = SUBSCRIPTION_MONTHLY_CREDITS.get(sub.plan_name, 0)
+    if credits <= 0:
+        return 0
+    if db.query(SubscriptionCreditGrant).filter(SubscriptionCreditGrant.grant_key == grant_key).first():
+        return 0
+    try:
+        with db.begin_nested():  # savepoint: a concurrent duplicate only undoes this insert
+            db.add(SubscriptionCreditGrant(
+                subscription_id=sub.id, user_id=sub.user_id, grant_key=grant_key, credits=credits,
+            ))
+            db.flush()
+    except IntegrityError:
+        return 0
+    db.query(User).filter(User.id == sub.user_id).update(
+        {User.available_credits: User.available_credits + credits}, synchronize_session=False,
+    )
+    return credits
+
+
+def _grant_monthly_payment_credits(db: Session, sub: "Subscription", payment_id) -> int:
+    """Monthly plans: one month of credits per Razorpay payment."""
+    if sub.billing_cycle != "monthly" or not payment_id:
+        return 0
+    return _grant_subscription_credits(db, sub, f"sub:{sub.id}:payment:{payment_id}")
+
+
+def _grant_due_annual_credits(db: Session, sub: "Subscription") -> int:
+    """Annual plans: one month of credits for every month of the paid period that
+    has started, from the subscription's start date up to its paid-through date."""
+    if sub.billing_cycle != "annual" or not sub.razorpay_subscription_id or not sub.is_active:
+        return 0
+    if sub.auto_renew_status not in ("active", "cancelled_pending", "halted"):
+        return 0
+    start, end, now = _as_aware(sub.start_date), _as_aware(sub.end_date), _utcnow()
+    if not start or not end:
+        return 0
+    granted, k = 0, 0
+    while k < 240:
+        month_start = _add_months(start, k)
+        if month_start > now or month_start >= end:
+            break
+        granted += _grant_subscription_credits(db, sub, f"sub:{sub.id}:month:{k}")
+        k += 1
+    return granted
+
+
+def _settle_subscription_credits(db: Session, user_id: int) -> int:
+    """Credit any annual-plan months that have started since the last visit.
+    Called before a balance is shown or spent, so the drip needs no cron job."""
+    subs = db.query(Subscription).filter(
+        Subscription.user_id == user_id,
+        Subscription.is_active == True,
+        Subscription.billing_cycle == "annual",
+        Subscription.razorpay_subscription_id != None,
+    ).all()
+    total = sum(_grant_due_annual_credits(db, s) for s in subs)
+    if total:
+        db.commit()
+    return total
+
+
+@app.get("/api/subscriptions/config")
+def subscription_config():
+    """Whether subscriptions can be bought yet, and the credits each plan adds per month."""
+    return {"enabled": _subscriptions_configured(), "monthly_credits": SUBSCRIPTION_MONTHLY_CREDITS}
+
+
 @app.post("/api/subscriptions/create-subscription")
-def create_recurring_subscription(req: SubCreateRecurring, db: Session = Depends(get_db)):
-    """Create a Razorpay subscription and return its short_url for the JS SDK."""
+def create_recurring_subscription(
+    req: SubCreateRecurring,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a Razorpay subscription for the signed-in user and return its short_url."""
+    if not _subscriptions_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Subscriptions are not available yet. Please buy a credit pack instead.",
+        )
     plan_id = RAZORPAY_PLAN_IDS.get((req.plan_name, req.billing_cycle))
     if not plan_id:
         raise HTTPException(status_code=400, detail="Unknown plan or billing cycle")
-    user = db.query(User).filter(User.id == req.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = current_user
     total_count = RAZORPAY_TOTAL_COUNT.get(req.billing_cycle, 60)
-    sub = razorpay_client.subscription.create({
-        "plan_id": plan_id,
-        "total_count": total_count,
-        "customer_notify": 1,
-        "notes": {
-            "user_id": str(req.user_id),
-            "plan_name": req.plan_name,
-            "billing_cycle": req.billing_cycle,
-        },
-    })
+    try:
+        sub = razorpay_client.subscription.create({
+            "plan_id": plan_id,
+            "total_count": total_count,
+            "customer_notify": 1,
+            "notes": {
+                "user_id": str(user.id),
+                "plan_name": req.plan_name,
+                "billing_cycle": req.billing_cycle,
+            },
+        })
+    except Exception as exc:
+        print(f"Razorpay subscription.create failed: {exc}")
+        raise HTTPException(status_code=502, detail="Could not start the subscription with Razorpay. Please try again.")
     # Pending row — fills in on subscription.activated webhook OR verify-initial-payment callback.
     pending = Subscription(
         user_id=user.id,
@@ -1716,7 +1796,11 @@ def create_recurring_subscription(req: SubCreateRecurring, db: Session = Depends
 
 
 @app.post("/api/subscriptions/verify-initial-payment")
-def verify_initial_subscription_payment(req: SubVerifyInitial, db: Session = Depends(get_db)):
+def verify_initial_subscription_payment(
+    req: SubVerifyInitial,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """JS SDK callback after the user authorises the mandate / first charge.
 
     NOTE: signature format for Subscriptions API is `payment_id|subscription_id`,
@@ -1736,7 +1820,7 @@ def verify_initial_subscription_payment(req: SubVerifyInitial, db: Session = Dep
         .filter(Subscription.razorpay_subscription_id == req.razorpay_subscription_id)
         .first()
     )
-    if not row or row.user_id != req.user_id:
+    if not row or row.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
     # Pull live state from Razorpay (authoritative for dates).
@@ -1750,7 +1834,7 @@ def verify_initial_subscription_payment(req: SubVerifyInitial, db: Session = Dep
 
     # Deactivate any prior active subs for this user (mirrors existing pattern).
     db.query(Subscription).filter(
-        Subscription.user_id == req.user_id,
+        Subscription.user_id == current_user.id,
         Subscription.is_active == True,
         Subscription.id != row.id,
     ).update({"is_active": False, "auto_renew_status": "cancelled"})
@@ -1765,17 +1849,25 @@ def verify_initial_subscription_payment(req: SubVerifyInitial, db: Session = Dep
 
     # Match existing admin-payments accounting: every sub event gets a CreditTransaction.
     txn = CreditTransaction(
-        user_id=req.user_id,
+        user_id=current_user.id,
         plan_name=f"sub:{row.plan_name}",
         credits_added=0,
         amount_paid=0,  # initial mandate may be a ₹0 token; real charges write via webhook.
     )
     db.add(txn)
+    db.flush()
+    # First month's credits. Keyed so the subscription.charged webhook for the
+    # same payment (monthly) or the same month (annual) cannot add them again.
+    granted = (_grant_monthly_payment_credits(db, row, req.razorpay_payment_id)
+               + _grant_due_annual_credits(db, row))
     db.commit()
+    db.refresh(current_user)
     return {
         "message": "Subscription activated",
         "expires_on": _iso_z(row.end_date),
         "auto_renew_status": row.auto_renew_status,
+        "credits_granted": granted,
+        "new_balance": current_user.available_credits,
     }
 
 
@@ -1819,6 +1911,8 @@ def upgrade_subscription(
     db: Session = Depends(get_db),
 ):
     """Instant switch: cancel current Razorpay sub immediately, create new one, charge full new plan."""
+    if not _subscriptions_configured():
+        raise HTTPException(status_code=503, detail="Subscriptions are not available yet.")
     new_plan_id = RAZORPAY_PLAN_IDS.get((req.new_plan, req.billing_cycle))
     if not new_plan_id:
         raise HTTPException(status_code=400, detail="Unknown new plan or billing cycle")
@@ -1923,6 +2017,12 @@ def _apply_subscription_event(db: Session, evt: dict) -> None:
                 amount_paid=float(amount_paise) / 100.0,
             )
             db.add(txn)
+            db.flush()
+            # Monthly plans: this payment's month of credits (no-op if the
+            # checkout callback already granted it).
+            _grant_monthly_payment_credits(db, row, payment_entity.get("id"))
+        # Annual plans: credit every month of the paid period that has started.
+        _grant_due_annual_credits(db, row)
     elif event_type == "subscription.halted":
         # Recurring charge failed past Razorpay's retry window. Keep access until end_date;
         # the daily reconcile sweep deactivates when end_date passes.
@@ -4156,6 +4256,7 @@ def _get_ec2_session():
 
 
 def deduct_credits_or_raise(user_id: int, lab_id: str, db: Session):
+    _settle_subscription_credits(db, user_id)  # any subscription months now due
     lab = db.query(LabCatalog).filter(
         LabCatalog.lab_id == lab_id, LabCatalog.is_active == True
     ).first()

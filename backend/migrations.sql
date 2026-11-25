@@ -811,6 +811,24 @@ SET action = entity_id, entity_type = action, entity_id = entity_type
 WHERE action IN ('university', 'university_student', 'university_semester')
   AND entity_id IS NOT NULL;
 
+-- ------------------------------------------------------------
+-- 2026-11-25: subscriptions are credit plans. One row per monthly credit grant;
+-- grant_key is unique so a month (annual) or a payment (monthly) is never
+-- credited twice.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS subscription_credit_grants (
+    id SERIAL PRIMARY KEY,
+    subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    grant_key VARCHAR(120) NOT NULL UNIQUE,
+    credits INTEGER NOT NULL,
+    granted_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_subscription_credit_grants_user ON subscription_credit_grants (user_id);
+CREATE INDEX IF NOT EXISTS ix_subscription_credit_grants_sub ON subscription_credit_grants (subscription_id);
+GRANT ALL PRIVILEGES ON TABLE subscription_credit_grants TO dojo_admin;
+GRANT USAGE, SELECT ON SEQUENCE subscription_credit_grants_id_seq TO dojo_admin;
+
 -- ============================================================
 -- SEED FIRST SUPERADMIN
 -- ============================================================
