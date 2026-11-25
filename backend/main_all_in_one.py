@@ -4262,6 +4262,41 @@ def _record_run_instances(parsed=None, **kwargs):
         ctx["instances"].extend(i["InstanceId"] for i in parsed.get("Instances", []) if i.get("InstanceId"))
 
 
+# Windows labs use Amazon's current "Windows Server 2022 English Full Base"
+# image. Amazon publishes a new dated image every month and withdraws old ones
+# after a few months, so a pinned image id eventually fails with
+# "AuthFailure: Not authorized for images" (it did on 2026-11-25). The newest
+# image is looked up at launch and cached for a few hours.
+_WINDOWS_AMI_NAME = "Windows_Server-2022-English-Full-Base-*"
+_WINDOWS_AMI_FALLBACK = "ami-05f035b6ae19778b1"  # last pinned image; used only if the lookup fails
+_WINDOWS_AMI_TTL_SECONDS = 6 * 3600
+_windows_ami_cache = {"id": None, "at": 0.0}
+
+
+def _windows_ami(sess) -> str:
+    """Id of the newest available Amazon Windows Server 2022 Base image."""
+    now = time.time()
+    if _windows_ami_cache["id"] and now - _windows_ami_cache["at"] < _WINDOWS_AMI_TTL_SECONDS:
+        return _windows_ami_cache["id"]
+    try:
+        images = sess.client("ec2").describe_images(
+            Owners=["amazon"],
+            Filters=[
+                {"Name": "name", "Values": [_WINDOWS_AMI_NAME]},
+                {"Name": "state", "Values": ["available"]},
+            ],
+        ).get("Images", [])
+        if images:
+            newest = max(images, key=lambda i: i.get("CreationDate", ""))
+            _windows_ami_cache.update(id=newest["ImageId"], at=now)
+            print(f"Windows lab image: {newest['ImageId']} ({newest.get('Name')})")
+            return newest["ImageId"]
+        print("Windows image lookup found no images; using the last known id")
+    except Exception as exc:
+        print(f"Windows image lookup failed ({exc}); using the last known id")
+    return _windows_ami_cache["id"] or _WINDOWS_AMI_FALLBACK
+
+
 def _get_ec2_session():
     sess = boto3.Session(
         aws_access_key_id=_AWS_KEY_ID,
@@ -4877,7 +4912,7 @@ def extend_lab_route(
 # START-LAB ENDPOINTS — 38 labs
 # ============================================================================
 
-# --- osf1: Windows, t2.micro, ami-05f035b6ae19778b1, duration=60 ---
+# --- osf1: Windows, t2.micro, latest Windows Server 2022 Base, duration=60 ---
 @app.post("/api/start-lab-csfc-osf1")
 @_refund_on_failure
 async def start_lab_csfc_osf1(
@@ -4890,7 +4925,7 @@ async def start_lab_csfc_osf1(
     cost, rem = deduct_credits_or_raise(uid, "csfc-osf1", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -4900,7 +4935,7 @@ async def start_lab_csfc_osf1(
     return _build_response("csfc-osf1", now, ends, cost, rem, [creds])
 
 
-# --- osf2: Windows, t2.small, ami-05f035b6ae19778b1, duration=60 ---
+# --- osf2: Windows, t2.small, latest Windows Server 2022 Base, duration=60 ---
 @app.post("/api/start-lab-csfc-osf2")
 @_refund_on_failure
 async def start_lab_csfc_osf2(
@@ -4913,7 +4948,7 @@ async def start_lab_csfc_osf2(
     cost, rem = deduct_credits_or_raise(uid, "csfc-osf2", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.small', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5080,7 +5115,7 @@ async def start_lab_csfc_osf9(
     return _build_response("csfc-osf9", now, ends, cost, rem, [creds])
 
 
-# --- nf1-nf9: Windows, t2.micro, ami-05f035b6ae19778b1 ---
+# --- nf1-nf9: Windows, t2.micro, latest Windows Server 2022 Base ---
 @app.post("/api/start-lab-csfc-nf1")
 @_refund_on_failure
 async def start_lab_csfc_nf1(
@@ -5093,7 +5128,7 @@ async def start_lab_csfc_nf1(
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf1", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5115,7 +5150,7 @@ async def start_lab_csfc_nf2(
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf2", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5137,7 +5172,7 @@ async def start_lab_csfc_nf3(
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf3", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5159,7 +5194,7 @@ async def start_lab_csfc_nf4(
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf4", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5181,7 +5216,7 @@ async def start_lab_csfc_nf5(
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf5", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5203,7 +5238,7 @@ async def start_lab_csfc_nf6(
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf6", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5225,7 +5260,7 @@ async def start_lab_csfc_nf7(
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf7", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5247,7 +5282,7 @@ async def start_lab_csfc_nf8(
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf8", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5269,7 +5304,7 @@ async def start_lab_csfc_nf9(
     cost, rem = deduct_credits_or_raise(uid, "csfc-nf9", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5279,7 +5314,7 @@ async def start_lab_csfc_nf9(
     return _build_response("csfc-nf9", now, ends, cost, rem, [creds])
 
 
-# --- naf1-naf3: Windows, t2.micro, ami-05f035b6ae19778b1 ---
+# --- naf1-naf3: Windows, t2.micro, latest Windows Server 2022 Base ---
 @app.post("/api/start-lab-csfc-naf1")
 @_refund_on_failure
 async def start_lab_csfc_naf1(
@@ -5292,7 +5327,7 @@ async def start_lab_csfc_naf1(
     cost, rem = deduct_credits_or_raise(uid, "csfc-naf1", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5314,7 +5349,7 @@ async def start_lab_csfc_naf2(
     cost, rem = deduct_credits_or_raise(uid, "csfc-naf2", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5336,7 +5371,7 @@ async def start_lab_csfc_naf3(
     cost, rem = deduct_credits_or_raise(uid, "csfc-naf3", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG], UserData=_USER_DATA_AMAZON_LINUX,
     )[0]
@@ -5555,7 +5590,7 @@ async def start_lab_csfc_ptf2(
     cost, rem = deduct_credits_or_raise(uid, "csfc-ptf2", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG],
     )[0]
@@ -5609,7 +5644,7 @@ async def start_lab_cutm2(
     cost, rem = deduct_credits_or_raise(uid, "cutm2", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     win_inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG],
     )[0]
@@ -5639,7 +5674,7 @@ async def start_lab_cutm3(
     cost, rem = deduct_credits_or_raise(uid, "cutm3", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     win_inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG],
     )[0]
@@ -5746,7 +5781,7 @@ async def start_lab_ns_lab1(
     cost, rem = deduct_credits_or_raise(uid, "ns-lab1", db)
     sess = _get_ec2_session(); ec2 = sess.resource('ec2')
     inst = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t2.micro', KeyName='kp22',
         SecurityGroupIds=[_DEFAULT_SG],
     )[0]
@@ -5792,7 +5827,7 @@ async def start_lab_dpi_lab1(
             pass
 
     win_instances = ec2.create_instances(
-        ImageId='ami-05f035b6ae19778b1', MinCount=1, MaxCount=1,
+        ImageId=_windows_ami(sess), MinCount=1, MaxCount=1,
         InstanceType='t3a.micro', KeyName='kp22',
         SecurityGroupIds=[_DPI_SG], SubnetId=_PUBLIC_SUBNET,
     )
