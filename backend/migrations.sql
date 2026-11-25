@@ -405,6 +405,12 @@ VALUES
      10)
 ON CONFLICT (slug) DO NOTHING;
 
+-- The four ₹1 seed courses above were live and purchasable for ₹1 until 2026-11-25. Keep them
+-- hidden while they still cost ₹1; an admin who sets a real price can re-activate them.
+UPDATE course_catalog SET is_active = FALSE
+WHERE slug IN ('test-course', 'the-defender', 'the-analyst', 'the-trailblazer')
+  AND price_inr <= 1 AND is_active = TRUE;
+
 -- Auto-update course_catalog.updated_at on row change.
 DROP TRIGGER IF EXISTS course_catalog_set_updated_at ON course_catalog;
 CREATE TRIGGER course_catalog_set_updated_at
@@ -794,6 +800,16 @@ ALTER TABLE assessments ADD COLUMN IF NOT EXISTS pass_percentage INTEGER DEFAULT
 ALTER TABLE assessments ADD COLUMN IF NOT EXISTS semester_id INTEGER
     REFERENCES university_semesters(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS ix_assessments_semester ON assessments (semester_id);
+
+-- ------------------------------------------------------------
+-- 2026-11-25: university/LMS audit rows were written as (action=<entity>,
+-- entity_type=<id>, entity_id=<verb>). The code now writes them correctly;
+-- this puts the old rows right. Idempotent: corrected rows no longer match.
+-- ------------------------------------------------------------
+UPDATE admin_audit_log
+SET action = entity_id, entity_type = action, entity_id = entity_type
+WHERE action IN ('university', 'university_student', 'university_semester')
+  AND entity_id IS NOT NULL;
 
 -- ============================================================
 -- SEED FIRST SUPERADMIN

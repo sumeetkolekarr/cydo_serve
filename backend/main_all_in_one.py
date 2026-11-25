@@ -3251,7 +3251,7 @@ def admin_create_university(req: UniCreateRequest, admin: Admin = Depends(get_cu
     db.add(u)
     db.commit()
     db.refresh(u)
-    write_audit(db, admin.id, "university", u.id, "create", {}, _uni_row(u))
+    write_audit(db, admin.id, "create", "university", u.id, {}, _uni_row(u))
     return _uni_row(u)
 
 @app.put("/api/admin/universities/{uid}")
@@ -3263,7 +3263,7 @@ def admin_update_university(uid: int, req: UniUpdateRequest, admin: Admin = Depe
     for k, v in req.dict(exclude_none=True).items():
         setattr(u, k, v)
     db.commit()
-    write_audit(db, admin.id, "university", u.id, "update", before, _uni_row(u))
+    write_audit(db, admin.id, "update", "university", u.id, before, _uni_row(u))
     return _uni_row(u)
 
 @app.delete("/api/admin/universities/{uid}")
@@ -3273,7 +3273,7 @@ def admin_delete_university(uid: int, admin: Admin = Depends(get_current_admin),
         raise HTTPException(status_code=404, detail="University not found")
     u.is_active = False
     db.commit()
-    write_audit(db, admin.id, "university", uid, "delete", {}, {"is_active": False})
+    write_audit(db, admin.id, "delete", "university", uid, {}, {"is_active": False})
     return {"success": True}
 
 @app.get("/api/admin/universities/{uid}/programs")
@@ -3318,7 +3318,7 @@ def admin_create_program(uid: int, req: ProgramCreateRequest, admin: Admin = Dep
     db.add(p)
     db.commit()
     db.refresh(p)
-    write_audit(db, admin.id, "university", uid, "create_program", {}, _prog_row(p))
+    write_audit(db, admin.id, "create_program", "university", uid, {}, _prog_row(p))
     return _prog_row(p)
 
 @app.put("/api/admin/universities/{uid}/programs/{pid}")
@@ -3330,7 +3330,7 @@ def admin_update_program(uid: int, pid: int, req: ProgramUpdateRequest, admin: A
     for k, v in req.dict(exclude_none=True).items():
         setattr(p, k, v)
     db.commit()
-    write_audit(db, admin.id, "university", uid, "update_program", before, _prog_row(p))
+    write_audit(db, admin.id, "update_program", "university", uid, before, _prog_row(p))
     return _prog_row(p)
 
 @app.delete("/api/admin/universities/{uid}/programs/{pid}")
@@ -3340,7 +3340,7 @@ def admin_delete_program(uid: int, pid: int, admin: Admin = Depends(get_current_
         raise HTTPException(status_code=404, detail="Program not found")
     db.delete(p)
     db.commit()
-    write_audit(db, admin.id, "university", uid, "delete_program", {"program_id": pid}, {})
+    write_audit(db, admin.id, "delete_program", "university", uid, {"program_id": pid}, {})
     return {"success": True}
 
 @app.get("/api/admin/universities/{uid}/programs/{pid}/semesters")
@@ -3372,7 +3372,7 @@ def admin_save_semester(uid: int, pid: int, req: SemesterSaveRequest, admin: Adm
     db.add(s)
     db.commit()
     db.refresh(s)
-    write_audit(db, admin.id, "university", uid, "add_semester", {}, _sem_row(s))
+    write_audit(db, admin.id, "add_semester", "university", uid, {}, _sem_row(s))
     return _sem_row(s)
 
 @app.delete("/api/admin/universities/{uid}/programs/{pid}/semesters/{sem_id}")
@@ -3382,7 +3382,7 @@ def admin_delete_semester(uid: int, pid: int, sem_id: int, admin: Admin = Depend
         raise HTTPException(status_code=404, detail="Semester not found")
     db.delete(s)
     db.commit()
-    write_audit(db, admin.id, "university", uid, "delete_semester", {"semester_number": s.semester_number}, {})
+    write_audit(db, admin.id, "delete_semester", "university", uid, {"semester_number": s.semester_number}, {})
     return {"success": True}
 
 @app.get("/api/admin/universities/{uid}/students")
@@ -3418,7 +3418,7 @@ def admin_add_uni_student(uid: int, req: AddStudentRequest, admin: Admin = Depen
     db.add(us)
     db.commit()
     db.refresh(us)
-    write_audit(db, admin.id, "university", uid, "add_student", {}, {"user_email": email, "program_id": req.program_id})
+    write_audit(db, admin.id, "add_student", "university", uid, {}, {"user_email": email, "program_id": req.program_id})
     prog = db.query(UniversityProgram).filter(UniversityProgram.id == req.program_id).first() if req.program_id else None
     return _ustudent_row(us, user.email, prog.name if prog else None)
 
@@ -3461,7 +3461,7 @@ async def admin_upload_students_csv(uid: int, file: UploadFile, admin: Admin = D
         db.add(UniversityStudent(university_id=uid, program_id=None, user_id=user.id, status="pending"))
         enrolled.append(raw)
     db.commit()
-    write_audit(db, admin.id, "university", uid, "bulk_csv_enroll", {}, {"enrolled": len(enrolled)})
+    write_audit(db, admin.id, "bulk_csv_enroll", "university", uid, {}, {"enrolled": len(enrolled)})
     return {"enrolled": enrolled, "skipped": skipped, "not_found": not_found, "domain_blocked": domain_blocked}
 
 @app.delete("/api/admin/universities/{uid}/students/{user_id}")
@@ -3473,7 +3473,7 @@ def admin_remove_uni_student(uid: int, user_id: int, admin: Admin = Depends(get_
         raise HTTPException(status_code=404, detail="Student not found")
     db.delete(us)
     db.commit()
-    write_audit(db, admin.id, "university", uid, "remove_student", {"user_id": user_id}, {})
+    write_audit(db, admin.id, "remove_student", "university", uid, {"user_id": user_id}, {})
     return {"success": True}
 
 @app.put("/api/admin/universities/{uid}/students/{user_id}/lms-access")
@@ -3519,8 +3519,7 @@ def admin_set_lms_access(
             us.razorpay_payment_id = None
 
     db.commit()
-    write_audit(db, admin.id, "university_student", us.id,
-                "grant_lms_access" if req.lms_paid else "revoke_lms_access",
+    write_audit(db, admin.id, "grant_lms_access" if req.lms_paid else "revoke_lms_access", "university_student", us.id,
                 before, _ustudent_row(us))
     return _ustudent_row(us)
 
@@ -3547,7 +3546,7 @@ def admin_promote_student(uid: int, user_id: int, admin: Admin = Depends(get_cur
     us.status = "active"
     us.promoted_at = datetime.utcnow()
     db.commit()
-    write_audit(db, admin.id, "university", uid, "promote_student", {"user_id": user_id, "from_sem": next_sem - 1}, {"to_sem": next_sem})
+    write_audit(db, admin.id, "promote_student", "university", uid, {"user_id": user_id, "from_sem": next_sem - 1}, {"to_sem": next_sem})
     return {"success": True, "current_semester": next_sem}
 
 @app.post("/api/admin/universities/{uid}/students/bulk-promote")
@@ -3574,7 +3573,7 @@ def admin_bulk_promote(uid: int, admin: Admin = Depends(get_current_admin), db: 
         us.promoted_at = datetime.utcnow()
         promoted += 1
     db.commit()
-    write_audit(db, admin.id, "university", uid, "bulk_promote", {}, {"promoted_count": promoted})
+    write_audit(db, admin.id, "bulk_promote", "university", uid, {}, {"promoted_count": promoted})
     return {"success": True, "promoted": promoted}
 
 
@@ -4392,6 +4391,24 @@ def get_course_by_slug(slug: str, db: Session = Depends(get_db)):
 # Replaces the previous Descp -> /subscription redirect. User clicks Enroll on
 # a course card; frontend asks for an order, Razorpay popup opens with the
 # GST-inclusive amount, verify endpoint signs off and records the purchase.
+
+@app.get("/api/courses/{slug}/my-access")
+def my_course_access(slug: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Whether the signed-in user has bought this course (drives the curriculum banner)."""
+    purchased = db.query(CoursePurchase).filter(
+        CoursePurchase.user_id == current_user.id, CoursePurchase.course_slug == slug
+    ).first() is not None
+    return {"purchased": purchased}
+
+
+@app.get("/api/bootcamps/{slug}/my-access")
+def my_bootcamp_access(slug: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Whether the signed-in user has bought this bootcamp."""
+    purchased = db.query(BootcampPurchase).filter(
+        BootcampPurchase.user_id == current_user.id, BootcampPurchase.bootcamp_slug == slug
+    ).first() is not None
+    return {"purchased": purchased}
+
 
 @app.post("/api/courses/{slug}/create-order")
 def create_course_order(
@@ -5752,7 +5769,7 @@ def admin_check_semester_links(
     sem.links_checked_at = datetime.now(timezone.utc)
     db.commit()
 
-    write_audit(db, admin.id, "university_semester", sem.id, "check_links", None, {
+    write_audit(db, admin.id, "check_links", "university_semester", sem.id, None, {
         "total": sem.links_total, "ok": sem.links_ok, "warn": sem.links_warn,
     })
 
